@@ -312,6 +312,9 @@ func processBatchJob(ctx context.Context, job batchJob, opts pipeline.Options, r
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		_ = runner.Close()
+	}()
 
 	var results []outputResult
 	for _, output := range job.Outputs {

@@ -6,12 +6,18 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
+)
+
+const (
+	appFFmpegHelperEnv = "SUBKIT_APP_TEST_FFMPEG_HELPER"
+	appFFmpegExeEnv    = "SUBKIT_APP_TEST_FFMPEG_EXE"
 )
 
 func TestResolveInputsExpandsGlobsDeduplicatesAndPreservesOrder(t *testing.T) {
@@ -190,6 +196,77 @@ func TestRootCommandRejectsOutWithMultipleInputs(t *testing.T) {
 	}
 }
 
+func TestRootCommandRejectsExtractAudioWithoutOutputByDefault(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "movie.mp4")
+	writeTestFile(t, input)
+
+	cmd := NewRootCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--cache-dir", filepath.Join(dir, "cache"), "extract-audio", input, "--progress", "off"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "extract-audio requires --out") {
+		t.Fatalf("expected missing output rejection, got %v", err)
+	}
+}
+
+func TestRootCommandExtractAudioExplicitOutputAvoidsPersistentAudioCache(t *testing.T) {
+	dir := t.TempDir()
+	installAppFakeFFmpeg(t, dir)
+	input := filepath.Join(dir, "movie.mp4")
+	output := filepath.Join(dir, "movie.flac")
+	cacheDir := filepath.Join(dir, "cache")
+	writeTestFile(t, input)
+
+	cmd := NewRootCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--cache-dir", cacheDir, "extract-audio", input, "--out", output, "--progress", "off"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "audio" {
+		t.Fatalf("output audio = %q, want fake audio content", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "audio")); !os.IsNotExist(err) {
+		t.Fatalf("persistent audio cache dir exists unexpectedly: %v", err)
+	}
+}
+
+func TestRootCommandExtractAudioCacheAudioAllowsArtifactOnly(t *testing.T) {
+	dir := t.TempDir()
+	installAppFakeFFmpeg(t, dir)
+	input := filepath.Join(dir, "movie.mp4")
+	cacheDir := filepath.Join(dir, "cache")
+	writeTestFile(t, input)
+
+	cmd := NewRootCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--cache-dir", cacheDir, "--cache-audio", "extract-audio", input, "--progress", "off"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(cacheDir, "audio"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("persistent audio cache entries = %d, want 1", len(entries))
+	}
+	if !strings.Contains(out.String(), entries[0].Name()) {
+		t.Fatalf("command output %q did not include cached artifact name %q", out.String(), entries[0].Name())
+	}
+}
+
 func writeTestFile(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
@@ -198,4 +275,56 @@ func writeTestFile(t *testing.T, path string) {
 	if err := os.WriteFile(path, []byte("test"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func installAppFakeFFmpeg(t *testing.T, dir string) {
+	t.Helper()
+
+	t.Setenv(appFFmpegHelperEnv, "1")
+	t.Setenv(appFFmpegExeEnv, os.Args[0])
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "ffmpeg.bat")
+		script := "@echo off\r\n\"%" + appFFmpegExeEnv + "%\" -test.run=TestHelperProcess -- %*\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		path := filepath.Join(dir, "ffmpeg")
+		script := "#!/bin/sh\nexec \"$" + appFFmpegExeEnv + "\" -test.run=TestHelperProcess -- \"$@\"\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv(appFFmpegHelperEnv) != "1" {
+		return
+	}
+
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) > 0 {
+		args = args[1:]
+	}
+
+	if len(args) > 0 && args[0] == "-version" {
+		_, _ = os.Stdout.WriteString("ffmpeg version subkit-app-test\n")
+		os.Exit(0)
+	}
+	if len(args) == 0 {
+		os.Exit(1)
+	}
+
+	output := args[len(args)-1]
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
+		os.Exit(1)
+	}
+	if err := os.WriteFile(output, []byte("audio"), 0o644); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }

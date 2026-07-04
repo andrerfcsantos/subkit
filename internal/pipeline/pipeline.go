@@ -19,10 +19,11 @@ import (
 const PipelineVersion = "subkit.pipeline.v1"
 
 type CacheOptions struct {
-	Dir     string
-	NoCache bool
-	Refresh bool
-	Rerun   []string
+	Dir        string
+	NoCache    bool
+	Refresh    bool
+	Rerun      []string
+	CacheAudio bool
 }
 
 type Options struct {
@@ -45,6 +46,7 @@ type Runner struct {
 	Store          *cache.Store
 	Opts           Options
 	Reporter       Reporter
+	tempDir        string
 	audioMemo      *memoAudio
 	transcriptMemo *memoTranscript
 	cuesMemo       *memoCues
@@ -74,6 +76,12 @@ type memoCues struct {
 	Data      subtitle.CueSet
 }
 
+type audioIdentity struct {
+	MediaPath string
+	Key       string
+	Ext       string
+}
+
 func NewRunner(opts Options, out io.Writer) (*Runner, error) {
 	return NewRunnerWithReporter(opts, &WriterReporter{Out: out})
 }
@@ -88,17 +96,23 @@ func NewRunnerWithReporter(opts Options, reporter Reporter) (*Runner, error) {
 	return &Runner{Store: store, Opts: opts, Reporter: reporter}, nil
 }
 
-func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, error) {
-	mediaPath, err := filepath.Abs(mediaPath)
-	if err != nil {
-		return Artifact{}, err
+func (r *Runner) Close() error {
+	if r.tempDir == "" {
+		return nil
 	}
-	if r.audioMemo != nil && r.audioMemo.MediaPath == mediaPath {
-		return r.audioMemo.Artifact, nil
-	}
-	sourceHash, err := cache.FileSHA256(mediaPath)
+	tempDir := r.tempDir
+	r.tempDir = ""
+	return os.RemoveAll(tempDir)
+}
+
+func (r *Runner) audioIdentity(ctx context.Context, mediaPath string) (audioIdentity, error) {
+	absMediaPath, err := filepath.Abs(mediaPath)
 	if err != nil {
-		return Artifact{}, err
+		return audioIdentity{}, err
+	}
+	sourceHash, err := cache.FileSHA256(absMediaPath)
+	if err != nil {
+		return audioIdentity{}, err
 	}
 	key, err := cache.HashJSON(map[string]any{
 		"pipeline":       PipelineVersion,
@@ -108,24 +122,51 @@ func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, e
 		"ffmpeg_version": media.FFmpegVersion(ctx),
 	})
 	if err != nil {
-		return Artifact{}, err
+		return audioIdentity{}, err
 	}
 
-	ext := media.AudioExtension(r.Opts.Audio.Format)
-	path := r.Store.Path("audio", key, ext)
-	if r.Store.CanRead("audio") && r.Store.Exists(path) {
+	return audioIdentity{
+		MediaPath: absMediaPath,
+		Key:       key,
+		Ext:       media.AudioExtension(r.Opts.Audio.Format),
+	}, nil
+}
+
+func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, error) {
+	identity, err := r.audioIdentity(ctx, mediaPath)
+	if err != nil {
+		return Artifact{}, err
+	}
+	return r.ensureAudio(ctx, identity)
+}
+
+func (r *Runner) ensureAudio(ctx context.Context, identity audioIdentity) (Artifact, error) {
+	if r.audioMemo != nil && r.audioMemo.MediaPath == identity.MediaPath && r.audioMemo.Artifact.Key == identity.Key && r.Store.Exists(r.audioMemo.Artifact.Path) {
+		return r.audioMemo.Artifact, nil
+	}
+
+	path, persistent, err := r.audioArtifactPath(identity.Key, identity.Ext)
+	if err != nil {
+		return Artifact{}, err
+	}
+	if persistent && r.Store.CanRead("audio") && r.Store.Exists(path) {
 		r.report(StageAudio, "cache hit %s", path)
-		artifact := Artifact{Kind: "audio", Key: key, Path: path, FromCache: true}
-		r.audioMemo = &memoAudio{MediaPath: mediaPath, Artifact: artifact}
+		artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path, FromCache: true}
+		r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
 		return artifact, nil
 	}
 
 	unlock := r.Store.LockPath(path)
 	defer unlock()
-	if r.Store.CanRead("audio") && r.Store.Exists(path) {
+	if persistent && r.Store.CanRead("audio") && r.Store.Exists(path) {
 		r.report(StageAudio, "cache hit %s", path)
-		artifact := Artifact{Kind: "audio", Key: key, Path: path, FromCache: true}
-		r.audioMemo = &memoAudio{MediaPath: mediaPath, Artifact: artifact}
+		artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path, FromCache: true}
+		r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
+		return artifact, nil
+	}
+	if !persistent && r.Store.Exists(path) {
+		artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path}
+		r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
 		return artifact, nil
 	}
 
@@ -145,14 +186,14 @@ func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, e
 	defer func() {
 		_ = os.Remove(tempPath)
 	}()
-	if err := media.ExtractAudio(ctx, mediaPath, tempPath, r.Opts.Audio); err != nil {
+	if err := media.ExtractAudio(ctx, identity.MediaPath, tempPath, r.Opts.Audio); err != nil {
 		return Artifact{}, err
 	}
 	if err := r.Store.CommitFile(tempPath, path); err != nil {
 		return Artifact{}, err
 	}
-	artifact := Artifact{Kind: "audio", Key: key, Path: path}
-	r.audioMemo = &memoAudio{MediaPath: mediaPath, Artifact: artifact}
+	artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path}
+	r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
 	return artifact, nil
 }
 
@@ -164,14 +205,14 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 	if r.transcriptMemo != nil && r.transcriptMemo.MediaPath == absMediaPath {
 		return r.transcriptMemo.Artifact, r.transcriptMemo.Data, nil
 	}
-	audioArtifact, err := r.EnsureAudio(ctx, mediaPath)
+	audioIdentity, err := r.audioIdentity(ctx, mediaPath)
 	if err != nil {
 		return Artifact{}, nil, err
 	}
 	key, err := cache.HashJSON(map[string]any{
 		"pipeline":  PipelineVersion,
 		"step":      "transcript",
-		"audio_key": audioArtifact.Key,
+		"audio_key": audioIdentity.Key,
 		"options":   r.Opts.Deepgram,
 	})
 	if err != nil {
@@ -224,6 +265,10 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 	}
 
 	r.report(StageTranscribe, "calling Deepgram")
+	audioArtifact, err := r.ensureAudio(ctx, audioIdentity)
+	if err != nil {
+		return Artifact{}, nil, err
+	}
 	client := deepgram.Client{}
 	contentType := media.AudioContentType(r.Opts.Audio.Format)
 	t, raw, err := client.TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
@@ -446,6 +491,40 @@ func (r *Runner) EnsureWords(ctx context.Context, mediaPath string, outputPath s
 
 func (r *Runner) CacheRoot() string {
 	return r.Store.Root
+}
+
+func (r *Runner) audioArtifactPath(key string, ext string) (string, bool, error) {
+	if r.persistAudio() {
+		return r.Store.Path("audio", key, ext), true, nil
+	}
+	tempDir, err := r.ensureTempDir()
+	if err != nil {
+		return "", false, err
+	}
+	return filepath.Join(tempDir, "audio", artifactFileName(key, ext)), false, nil
+}
+
+func (r *Runner) persistAudio() bool {
+	return r.Opts.Cache.CacheAudio && r.Store.CanWrite()
+}
+
+func (r *Runner) ensureTempDir() (string, error) {
+	if r.tempDir != "" {
+		return r.tempDir, nil
+	}
+	dir, err := os.MkdirTemp("", "subkit-audio-*")
+	if err != nil {
+		return "", fmt.Errorf("creating temporary audio dir: %w", err)
+	}
+	r.tempDir = dir
+	return dir, nil
+}
+
+func artifactFileName(key string, ext string) string {
+	if ext != "" && !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+	return key + ext
 }
 
 func (r *Runner) log(format string, args ...any) {

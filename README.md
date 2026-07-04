@@ -10,6 +10,8 @@ media file -> normalized audio -> normalized transcript -> cues -> rendered outp
 
 Each stage is cached independently. Re-running the same command with the same input and options should reuse cached artifacts, and if a final output file is missing it can be restored from the rendered artifact cache.
 
+Audio artifacts are temporary by default because they can grow quickly. Transcripts, raw provider responses, cues, and rendered outputs remain cached by default. Use `--cache-audio` when you want normalized audio artifacts to be stored and reused persistently.
+
 ## Commands
 
 ```bash
@@ -92,6 +94,7 @@ subkit subtitle movie.mp4 --refresh
 subkit subtitle movie.mp4 --rerun transcribe
 subkit subtitle movie.mp4 --rerun audio,transcribe
 subkit subtitle movie.mp4 --no-cache
+subkit subtitle movie.mp4 --cache-audio
 subkit --cache-dir ./.subkit-cache subtitle movie.mp4
 ```
 
@@ -102,6 +105,8 @@ C:\Users\andre\AppData\Local\subkit
 ```
 
 Cache keys include the source media hash, step options, pipeline version, and for audio extraction the ffmpeg version string.
+
+By default, audio extraction writes a temporary run-local artifact for provider upload or explicit copies. `extract-audio` therefore needs `--out`, `--output-dir`, or `--output-template` unless `--cache-audio` is set.
 
 ## Transcript schema
 

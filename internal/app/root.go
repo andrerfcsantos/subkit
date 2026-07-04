@@ -37,6 +37,7 @@ func NewRootCommand() *cobra.Command {
 	root.PersistentFlags().BoolVar(&opts.Cache.NoCache, "no-cache", false, "do not read or write the persistent cache")
 	root.PersistentFlags().BoolVar(&opts.Cache.Refresh, "refresh", false, "ignore cache reads and rebuild artifacts")
 	root.PersistentFlags().StringArrayVar(&opts.Cache.Rerun, "rerun", nil, "rerun selected steps: audio, transcribe, cues, render, or all")
+	root.PersistentFlags().BoolVar(&opts.Cache.CacheAudio, "cache-audio", false, "read and write persistent normalized audio artifacts")
 
 	subtitleCmd := &cobra.Command{
 		Use:   "subtitle <media-file> [media-file...]",
@@ -95,9 +96,12 @@ func NewRootCommand() *cobra.Command {
 
 	extractCmd := &cobra.Command{
 		Use:   "extract-audio <media-file> [media-file...]",
-		Short: "Extract and cache normalized audio artifacts",
+		Short: "Extract normalized audio artifacts",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if outPath == "" && outputDir == "" && batch.OutputTemplate == "" && !(opts.Cache.CacheAudio && !opts.Cache.NoCache) {
+				return fmt.Errorf("extract-audio requires --out, --output-dir, or --output-template unless persistent audio caching is enabled with --cache-audio")
+			}
 			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
