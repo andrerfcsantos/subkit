@@ -13,13 +13,13 @@ Each stage is cached independently. Re-running the same command with the same in
 ## Commands
 
 ```bash
-subkit subtitle <media-file>
-subkit generate <media-file> --output subtitle:srt --output subtitle:vtt --output script:txt --output words:json
+subkit subtitle <media-file> [media-file...]
+subkit generate <media-file> [media-file...] --output subtitle:srt --output subtitle:vtt --output script:txt --output words:json
 
-subkit extract-audio <media-file>
-subkit transcribe <media-file>
-subkit cues <media-file>
-subkit render <media-file> --output subtitle:srt
+subkit extract-audio <media-file> [media-file...]
+subkit transcribe <media-file> [media-file...]
+subkit cues <media-file> [media-file...]
+subkit render <media-file> [media-file...] --output subtitle:srt
 
 subkit cache path
 subkit cache list
@@ -31,6 +31,23 @@ Run locally with:
 ```bash
 go run ./cmd/subkit subtitle ./data/saudemental.mp4 --language pt-PT --model general --format srt --format vtt
 ```
+
+Batch runs accept explicit files or globs. Inputs are processed concurrently with a default limit of four files at a time:
+
+```bash
+subkit generate "./data/*.mp4" --output subtitle:srt --output script:txt --output-dir ./out
+subkit subtitle video-a.mp4 video-b.mp4 --format srt --format vtt --concurrency 2
+```
+
+Use `--output-template` when batch outputs need custom names. Supported tokens are `{dir}`, `{base}`, `{input_ext}`, `{kind}`, and `{format}`:
+
+```bash
+subkit generate "./data/*.mp4" --output subtitle:srt --output words:json --output-template "./out/{base}.{kind}.{format}"
+```
+
+Progress defaults to an interactive Bubble Tea view for multi-file terminal runs and plain logs when output is redirected. Override with `--progress auto|tui|plain|off`. Batch runs continue after per-file failures and print an error summary at the end; use `--fail-fast` to cancel remaining queued work after the first failure.
+
+For `extract-audio`, `transcribe`, and `cues`, `--out` remains a single-input exact path. Use `--output-dir` or `--output-template` for batch copies.
 
 The default Deepgram model is `nova-2-video`, per the prototype spec. Deepgram rejected `nova-2-video` with `pt-PT` during verification, so the sample Portuguese video currently needs `--model general --language pt-PT`.
 

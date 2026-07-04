@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +25,7 @@ func NewRootCommand() *cobra.Command {
 	var outputs []string
 	var outputDir string
 	var outPath string
+	var batch batchFlags
 
 	root := &cobra.Command{
 		Use:           "subkit",
@@ -39,41 +39,37 @@ func NewRootCommand() *cobra.Command {
 	root.PersistentFlags().StringArrayVar(&opts.Cache.Rerun, "rerun", nil, "rerun selected steps: audio, transcribe, cues, render, or all")
 
 	subtitleCmd := &cobra.Command{
-		Use:   "subtitle <media-file>",
-		Short: "Generate subtitle files for a media file",
-		Args:  cobra.ExactArgs(1),
+		Use:   "subtitle <media-file> [media-file...]",
+		Short: "Generate subtitle files for media files",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := pipeline.NewRunner(opts, cmd.OutOrStdout())
+			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
 			}
-			mediaPath := args[0]
 			selectedFormats := splitValues(formats)
 			if len(selectedFormats) == 0 {
 				selectedFormats = []string{"srt"}
 			}
-			for _, format := range selectedFormats {
-				target := outputInDir(mediaPath, outputDir, format)
-				_, path, copied, err := runner.EnsureSubtitle(cmd.Context(), mediaPath, format, target)
-				if err != nil {
-					return err
-				}
-				printResult(cmd, path, copied)
+			jobs, err := planSubtitleJobs(inputs, selectedFormats, outputDir, batch.OutputTemplate)
+			if err != nil {
+				return err
 			}
-			return nil
+			return runBatch(cmd.Context(), cmd.OutOrStdout(), opts, batch, jobs)
 		},
 	}
 	addPipelineFlags(subtitleCmd, &opts)
+	addBatchFlags(subtitleCmd, &batch)
 	subtitleCmd.Flags().StringArrayVarP(&formats, "format", "f", []string{"srt"}, "subtitle format; repeat or comma-separate values: srt,vtt")
 	subtitleCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for generated subtitle files")
 	root.AddCommand(subtitleCmd)
 
 	generateCmd := &cobra.Command{
-		Use:   "generate <media-file>",
-		Short: "Generate one or more outputs from a media file",
-		Args:  cobra.ExactArgs(1),
+		Use:   "generate <media-file> [media-file...]",
+		Short: "Generate one or more outputs from media files",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := pipeline.NewRunner(opts, cmd.OutOrStdout())
+			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
 			}
@@ -84,114 +80,91 @@ func NewRootCommand() *cobra.Command {
 			if len(specs) == 0 {
 				specs = []outputSpec{{Kind: "subtitle", Format: "srt"}}
 			}
-			for _, spec := range specs {
-				path, copied, err := runOutput(cmd.Context(), runner, args[0], outputDir, spec)
-				if err != nil {
-					return err
-				}
-				printResult(cmd, path, copied)
+			jobs, err := planRenderJobs(inputs, specs, outputDir, batch.OutputTemplate)
+			if err != nil {
+				return err
 			}
-			return nil
+			return runBatch(cmd.Context(), cmd.OutOrStdout(), opts, batch, jobs)
 		},
 	}
 	addPipelineFlags(generateCmd, &opts)
+	addBatchFlags(generateCmd, &batch)
 	generateCmd.Flags().StringArrayVarP(&outputs, "output", "o", nil, "output spec; repeat or comma-separate values like subtitle:srt,script:txt,words:json")
 	generateCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for generated output files")
 	root.AddCommand(generateCmd)
 
 	extractCmd := &cobra.Command{
-		Use:   "extract-audio <media-file>",
-		Short: "Extract and cache the normalized audio artifact",
-		Args:  cobra.ExactArgs(1),
+		Use:   "extract-audio <media-file> [media-file...]",
+		Short: "Extract and cache normalized audio artifacts",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := pipeline.NewRunner(opts, cmd.OutOrStdout())
+			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
 			}
-			artifact, err := runner.EnsureAudio(cmd.Context(), args[0])
+			jobs, err := planArtifactJobs(inputs, "audio", media.AudioExtension(opts.Audio.Format), outPath, outputDir, batch.OutputTemplate)
 			if err != nil {
 				return err
 			}
-			if outPath != "" {
-				_, err := cache.CopyFileIfDifferent(artifact.Path, outPath)
-				if err != nil {
-					return err
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", outPath)
-				return nil
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", artifact.Path)
-			return nil
+			return runBatch(cmd.Context(), cmd.OutOrStdout(), opts, batch, jobs)
 		},
 	}
 	addAudioFlags(extractCmd, &opts.Audio)
+	addBatchFlags(extractCmd, &batch)
 	extractCmd.Flags().StringVar(&outPath, "out", "", "copy artifact to this path")
+	extractCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for copied audio artifacts")
 	root.AddCommand(extractCmd)
 
 	transcribeCmd := &cobra.Command{
-		Use:   "transcribe <media-file>",
+		Use:   "transcribe <media-file> [media-file...]",
 		Short: "Extract audio if needed, transcribe it, and cache normalized transcript JSON",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := pipeline.NewRunner(opts, cmd.OutOrStdout())
+			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
 			}
-			artifact, _, err := runner.EnsureTranscript(cmd.Context(), args[0])
+			jobs, err := planArtifactJobs(inputs, "transcript", "json", outPath, outputDir, batch.OutputTemplate)
 			if err != nil {
 				return err
 			}
-			if outPath != "" {
-				_, err := cache.CopyFileIfDifferent(artifact.Path, outPath)
-				if err != nil {
-					return err
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", outPath)
-				return nil
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", artifact.Path)
-			return nil
+			return runBatch(cmd.Context(), cmd.OutOrStdout(), opts, batch, jobs)
 		},
 	}
 	addPipelineFlags(transcribeCmd, &opts)
+	addBatchFlags(transcribeCmd, &batch)
 	transcribeCmd.Flags().StringVar(&outPath, "out", "", "copy normalized transcript JSON to this path")
+	transcribeCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for copied transcript artifacts")
 	root.AddCommand(transcribeCmd)
 
 	cuesCmd := &cobra.Command{
-		Use:   "cues <media-file>",
-		Short: "Build and cache subtitle cues from a transcript",
-		Args:  cobra.ExactArgs(1),
+		Use:   "cues <media-file> [media-file...]",
+		Short: "Build and cache subtitle cues from transcripts",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := pipeline.NewRunner(opts, cmd.OutOrStdout())
+			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
 			}
-			artifact, _, err := runner.EnsureCues(cmd.Context(), args[0])
+			jobs, err := planArtifactJobs(inputs, "cues", "json", outPath, outputDir, batch.OutputTemplate)
 			if err != nil {
 				return err
 			}
-			if outPath != "" {
-				_, err := cache.CopyFileIfDifferent(artifact.Path, outPath)
-				if err != nil {
-					return err
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", outPath)
-				return nil
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", artifact.Path)
-			return nil
+			return runBatch(cmd.Context(), cmd.OutOrStdout(), opts, batch, jobs)
 		},
 	}
 	addPipelineFlags(cuesCmd, &opts)
+	addBatchFlags(cuesCmd, &batch)
 	cuesCmd.Flags().StringVar(&outPath, "out", "", "copy cue JSON to this path")
+	cuesCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for copied cue artifacts")
 	root.AddCommand(cuesCmd)
 
 	renderCmd := &cobra.Command{
-		Use:   "render <media-file>",
-		Short: "Render a subtitle/script/words output from cached or rebuilt artifacts",
-		Args:  cobra.ExactArgs(1),
+		Use:   "render <media-file> [media-file...]",
+		Short: "Render subtitle/script/words outputs from cached or rebuilt artifacts",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := pipeline.NewRunner(opts, cmd.OutOrStdout())
+			inputs, err := resolveInputs(args)
 			if err != nil {
 				return err
 			}
@@ -202,17 +175,15 @@ func NewRootCommand() *cobra.Command {
 			if len(specs) == 0 {
 				specs = []outputSpec{{Kind: "subtitle", Format: "srt"}}
 			}
-			for _, spec := range specs {
-				path, copied, err := runOutput(cmd.Context(), runner, args[0], outputDir, spec)
-				if err != nil {
-					return err
-				}
-				printResult(cmd, path, copied)
+			jobs, err := planRenderJobs(inputs, specs, outputDir, batch.OutputTemplate)
+			if err != nil {
+				return err
 			}
-			return nil
+			return runBatch(cmd.Context(), cmd.OutOrStdout(), opts, batch, jobs)
 		},
 	}
 	addPipelineFlags(renderCmd, &opts)
+	addBatchFlags(renderCmd, &batch)
 	renderCmd.Flags().StringArrayVarP(&outputs, "output", "o", []string{"subtitle:srt"}, "output spec; repeat or comma-separate values like subtitle:srt,script:txt,words:json")
 	renderCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for generated output files")
 	root.AddCommand(renderCmd)
@@ -348,25 +319,6 @@ func splitValues(values []string) []string {
 	return result
 }
 
-func runOutput(ctx context.Context, runner *pipeline.Runner, mediaPath string, outputDir string, spec outputSpec) (string, bool, error) {
-	switch spec.Kind {
-	case "subtitle", "subtitles":
-		_, path, copied, err := runner.EnsureSubtitle(ctx, mediaPath, spec.Format, outputInDir(mediaPath, outputDir, spec.Format))
-		return path, copied, err
-	case "script", "text":
-		_, path, copied, err := runner.EnsureScript(ctx, mediaPath, spec.Format, namedOutputInDir(mediaPath, outputDir, "script", spec.Format))
-		return path, copied, err
-	case "words":
-		if spec.Format != "json" {
-			return "", false, fmt.Errorf("words only supports json output for now")
-		}
-		_, path, copied, err := runner.EnsureWords(ctx, mediaPath, namedOutputInDir(mediaPath, outputDir, "words", "json"))
-		return path, copied, err
-	default:
-		return "", false, fmt.Errorf("unsupported output kind %q", spec.Kind)
-	}
-}
-
 func outputInDir(mediaPath string, outputDir string, ext string) string {
 	if outputDir == "" {
 		return ""
@@ -381,14 +333,6 @@ func namedOutputInDir(mediaPath string, outputDir string, suffix string, ext str
 	}
 	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
 	return filepath.Join(outputDir, base+"."+suffix+"."+ext)
-}
-
-func printResult(cmd *cobra.Command, path string, copied bool) {
-	if copied {
-		fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path)
-		return
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "cached %s\n", path)
 }
 
 func humanBytes(size int64) string {

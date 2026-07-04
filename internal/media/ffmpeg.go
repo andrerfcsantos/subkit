@@ -47,6 +47,7 @@ func ExtractAudio(ctx context.Context, input string, output string, opts AudioOp
 		args = append(args, "-ar", strconv.Itoa(opts.SampleRate))
 	}
 	args = append(args, audioCodecArgs(opts.Format)...)
+	args = append(args, audioFormatArgs(opts.Format)...)
 	args = append(args, output)
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
@@ -104,6 +105,21 @@ func audioCodecArgs(format string) []string {
 		return []string{"-c:a", "libmp3lame"}
 	case "m4a", "mp4":
 		return []string{"-c:a", "aac"}
+	default:
+		return nil
+	}
+}
+
+func audioFormatArgs(format string) []string {
+	switch AudioExtension(format) {
+	case "flac":
+		return []string{"-f", "flac"}
+	case "wav":
+		return []string{"-f", "wav"}
+	case "mp3":
+		return []string{"-f", "mp3"}
+	case "m4a", "mp4":
+		return []string{"-f", "mp4"}
 	default:
 		return nil
 	}

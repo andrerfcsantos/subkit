@@ -44,7 +44,7 @@ func DefaultOptions() Options {
 type Runner struct {
 	Store          *cache.Store
 	Opts           Options
-	LogOut         io.Writer
+	Reporter       Reporter
 	audioMemo      *memoAudio
 	transcriptMemo *memoTranscript
 	cuesMemo       *memoCues
@@ -75,13 +75,17 @@ type memoCues struct {
 }
 
 func NewRunner(opts Options, out io.Writer) (*Runner, error) {
+	return NewRunnerWithReporter(opts, &WriterReporter{Out: out})
+}
+
+func NewRunnerWithReporter(opts Options, reporter Reporter) (*Runner, error) {
 	read := !opts.Cache.NoCache
 	write := !opts.Cache.NoCache
 	store, err := cache.NewStore(opts.Cache.Dir, read, write, opts.Cache.Refresh, opts.Cache.Rerun)
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{Store: store, Opts: opts, LogOut: out}, nil
+	return &Runner{Store: store, Opts: opts, Reporter: reporter}, nil
 }
 
 func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, error) {
@@ -110,17 +114,41 @@ func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, e
 	ext := media.AudioExtension(r.Opts.Audio.Format)
 	path := r.Store.Path("audio", key, ext)
 	if r.Store.CanRead("audio") && r.Store.Exists(path) {
-		r.log("audio: cache hit %s", path)
+		r.report(StageAudio, "cache hit %s", path)
 		artifact := Artifact{Kind: "audio", Key: key, Path: path, FromCache: true}
 		r.audioMemo = &memoAudio{MediaPath: mediaPath, Artifact: artifact}
 		return artifact, nil
 	}
 
-	r.log("audio: extracting with ffmpeg")
+	unlock := r.Store.LockPath(path)
+	defer unlock()
+	if r.Store.CanRead("audio") && r.Store.Exists(path) {
+		r.report(StageAudio, "cache hit %s", path)
+		artifact := Artifact{Kind: "audio", Key: key, Path: path, FromCache: true}
+		r.audioMemo = &memoAudio{MediaPath: mediaPath, Artifact: artifact}
+		return artifact, nil
+	}
+
+	r.report(StageAudio, "extracting with ffmpeg")
 	if err := r.Store.EnsureDir(path); err != nil {
 		return Artifact{}, err
 	}
-	if err := media.ExtractAudio(ctx, mediaPath, path, r.Opts.Audio); err != nil {
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return Artifact{}, err
+	}
+	tempPath := temp.Name()
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return Artifact{}, err
+	}
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
+	if err := media.ExtractAudio(ctx, mediaPath, tempPath, r.Opts.Audio); err != nil {
+		return Artifact{}, err
+	}
+	if err := r.Store.CommitFile(tempPath, path); err != nil {
 		return Artifact{}, err
 	}
 	artifact := Artifact{Kind: "audio", Key: key, Path: path}
@@ -156,7 +184,20 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 		if err := r.Store.ReadJSON(path, &t); err != nil {
 			return Artifact{}, nil, err
 		}
-		r.log("transcribe: cache hit %s", path)
+		r.report(StageTranscribe, "cache hit %s", path)
+		artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: true}
+		r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: &t}
+		return artifact, &t, nil
+	}
+
+	unlock := r.Store.LockPath(path)
+	defer unlock()
+	if r.Store.CanRead("transcribe") && r.Store.Exists(path) {
+		var t transcript.Transcript
+		if err := r.Store.ReadJSON(path, &t); err != nil {
+			return Artifact{}, nil, err
+		}
+		r.report(StageTranscribe, "cache hit %s", path)
 		artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: true}
 		r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: &t}
 		return artifact, &t, nil
@@ -176,23 +217,20 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 		if err := r.Store.WriteJSON(path, t); err != nil {
 			return Artifact{}, nil, err
 		}
-		r.log("transcribe: rebuilt normalized transcript from raw cache")
+		r.report(StageTranscribe, "rebuilt normalized transcript from raw cache")
 		artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: true}
 		r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: &t}
 		return artifact, &t, nil
 	}
 
-	r.log("transcribe: calling Deepgram")
+	r.report(StageTranscribe, "calling Deepgram")
 	client := deepgram.Client{}
 	contentType := media.AudioContentType(r.Opts.Audio.Format)
 	t, raw, err := client.TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
 	if err != nil {
 		return Artifact{}, nil, err
 	}
-	if err := r.Store.EnsureDir(rawPath); err != nil {
-		return Artifact{}, nil, err
-	}
-	if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+	if err := r.Store.WriteFile(rawPath, raw, 0o644); err != nil {
 		return Artifact{}, nil, err
 	}
 	if err := r.Store.WriteJSON(path, t); err != nil {
@@ -231,13 +269,26 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 		if err := r.Store.ReadJSON(path, &cues); err != nil {
 			return Artifact{}, subtitle.CueSet{}, err
 		}
-		r.log("cues: cache hit %s", path)
+		r.report(StageCues, "cache hit %s", path)
 		artifact := Artifact{Kind: "cues", Key: key, Path: path, FromCache: true}
 		r.cuesMemo = &memoCues{MediaPath: absMediaPath, Artifact: artifact, Data: cues}
 		return artifact, cues, nil
 	}
 
-	r.log("cues: building subtitle cues")
+	unlock := r.Store.LockPath(path)
+	defer unlock()
+	if r.Store.CanRead("cues") && r.Store.Exists(path) {
+		var cues subtitle.CueSet
+		if err := r.Store.ReadJSON(path, &cues); err != nil {
+			return Artifact{}, subtitle.CueSet{}, err
+		}
+		r.report(StageCues, "cache hit %s", path)
+		artifact := Artifact{Kind: "cues", Key: key, Path: path, FromCache: true}
+		r.cuesMemo = &memoCues{MediaPath: absMediaPath, Artifact: artifact, Data: cues}
+		return artifact, cues, nil
+	}
+
+	r.report(StageCues, "building subtitle cues")
 	cues := subtitle.BuildCues(*t, r.Opts.Cues)
 	if err := r.Store.WriteJSON(path, cues); err != nil {
 		return Artifact{}, subtitle.CueSet{}, err
@@ -266,19 +317,24 @@ func (r *Runner) EnsureSubtitle(ctx context.Context, mediaPath string, format st
 
 	cachePath := r.Store.Path("outputs", key, format)
 	if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-		r.log("render: writing %s subtitle", format)
-		rendered, err := subtitle.Render(cues, format)
-		if err != nil {
-			return Artifact{}, "", false, err
+		unlock := r.Store.LockPath(cachePath)
+		if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
+			r.report(StageRender, "writing %s subtitle", format)
+			rendered, err := subtitle.Render(cues, format)
+			if err != nil {
+				unlock()
+				return Artifact{}, "", false, err
+			}
+			if err := r.Store.WriteFile(cachePath, []byte(rendered), 0o644); err != nil {
+				unlock()
+				return Artifact{}, "", false, err
+			}
+		} else {
+			r.report(StageRender, "cache hit %s", cachePath)
 		}
-		if err := r.Store.EnsureDir(cachePath); err != nil {
-			return Artifact{}, "", false, err
-		}
-		if err := os.WriteFile(cachePath, []byte(rendered), 0o644); err != nil {
-			return Artifact{}, "", false, err
-		}
+		unlock()
 	} else {
-		r.log("render: cache hit %s", cachePath)
+		r.report(StageRender, "cache hit %s", cachePath)
 	}
 
 	if outputPath == "" {
@@ -288,6 +344,7 @@ func (r *Runner) EnsureSubtitle(ctx context.Context, mediaPath string, format st
 	if err != nil {
 		return Artifact{}, "", false, err
 	}
+	r.reportWrite(outputPath, copied)
 	return Artifact{Kind: "subtitle", Key: key, Path: cachePath, FromCache: !copied}, outputPath, copied, nil
 }
 
@@ -312,18 +369,24 @@ func (r *Runner) EnsureScript(ctx context.Context, mediaPath string, format stri
 
 	cachePath := r.Store.Path("outputs", key, format)
 	if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-		if format != "txt" && format != "md" {
-			return Artifact{}, "", false, fmt.Errorf("unsupported script format %q", format)
+		unlock := r.Store.LockPath(cachePath)
+		if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
+			if format != "txt" && format != "md" {
+				unlock()
+				return Artifact{}, "", false, fmt.Errorf("unsupported script format %q", format)
+			}
+			r.report(StageRender, "writing %s script", format)
+			content := strings.TrimSpace(t.Text) + "\n"
+			if err := r.Store.WriteFile(cachePath, []byte(content), 0o644); err != nil {
+				unlock()
+				return Artifact{}, "", false, err
+			}
+		} else {
+			r.report(StageRender, "cache hit %s", cachePath)
 		}
-		content := strings.TrimSpace(t.Text) + "\n"
-		if err := r.Store.EnsureDir(cachePath); err != nil {
-			return Artifact{}, "", false, err
-		}
-		if err := os.WriteFile(cachePath, []byte(content), 0o644); err != nil {
-			return Artifact{}, "", false, err
-		}
+		unlock()
 	} else {
-		r.log("render: cache hit %s", cachePath)
+		r.report(StageRender, "cache hit %s", cachePath)
 	}
 
 	if outputPath == "" {
@@ -333,6 +396,7 @@ func (r *Runner) EnsureScript(ctx context.Context, mediaPath string, format stri
 	if err != nil {
 		return Artifact{}, "", false, err
 	}
+	r.reportWrite(outputPath, copied)
 	return Artifact{Kind: "script", Key: key, Path: cachePath, FromCache: !copied}, outputPath, copied, nil
 }
 
@@ -354,11 +418,19 @@ func (r *Runner) EnsureWords(ctx context.Context, mediaPath string, outputPath s
 
 	cachePath := r.Store.Path("outputs", key, "json")
 	if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-		if err := r.Store.WriteJSON(cachePath, t.Words); err != nil {
-			return Artifact{}, "", false, err
+		unlock := r.Store.LockPath(cachePath)
+		if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
+			r.report(StageRender, "writing words json")
+			if err := r.Store.WriteJSON(cachePath, t.Words); err != nil {
+				unlock()
+				return Artifact{}, "", false, err
+			}
+		} else {
+			r.report(StageRender, "cache hit %s", cachePath)
 		}
+		unlock()
 	} else {
-		r.log("render: cache hit %s", cachePath)
+		r.report(StageRender, "cache hit %s", cachePath)
 	}
 
 	if outputPath == "" {
@@ -368,6 +440,7 @@ func (r *Runner) EnsureWords(ctx context.Context, mediaPath string, outputPath s
 	if err != nil {
 		return Artifact{}, "", false, err
 	}
+	r.reportWrite(outputPath, copied)
 	return Artifact{Kind: "words", Key: key, Path: cachePath, FromCache: !copied}, outputPath, copied, nil
 }
 
@@ -376,10 +449,22 @@ func (r *Runner) CacheRoot() string {
 }
 
 func (r *Runner) log(format string, args ...any) {
-	if r.LogOut == nil {
+	r.report("", format, args...)
+}
+
+func (r *Runner) report(stage Stage, format string, args ...any) {
+	if r.Reporter == nil {
 		return
 	}
-	fmt.Fprintf(r.LogOut, format+"\n", args...)
+	r.Reporter.Report(Event{Stage: stage, Message: fmt.Sprintf(format, args...)})
+}
+
+func (r *Runner) reportWrite(path string, copied bool) {
+	if copied {
+		r.report(StageWrite, "wrote %s", path)
+		return
+	}
+	r.report(StageWrite, "cached %s", path)
 }
 
 func defaultOutputPath(mediaPath string, ext string) string {

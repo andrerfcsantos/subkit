@@ -1,16 +1,21 @@
 package cache
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+var pathLocks sync.Map
 
 type Store struct {
 	Root    string
@@ -93,23 +98,67 @@ func (s *Store) Exists(path string) bool {
 	return err == nil
 }
 
+func (s *Store) LockPath(path string) func() {
+	value, _ := pathLocks.LoadOrStore(lockKey(path), &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 func (s *Store) EnsureDir(path string) error {
 	return os.MkdirAll(filepath.Dir(path), 0o755)
 }
 
 func (s *Store) WriteJSON(path string, value any) error {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(value); err != nil {
+		return err
+	}
+	return s.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+func (s *Store) WriteFile(path string, data []byte, perm fs.FileMode) error {
 	if err := s.EnsureDir(path); err != nil {
 		return err
 	}
-	file, err := os.Create(path)
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	temp, err := os.CreateTemp(dir, "."+base+".tmp-*")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	tempPath := temp.Name()
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
 
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(value)
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Chmod(perm); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return s.CommitFile(tempPath, path)
+}
+
+func (s *Store) CommitFile(tempPath string, path string) error {
+	if err := s.EnsureDir(path); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return err
+		}
+		return os.Rename(tempPath, path)
+	}
+	return nil
 }
 
 func (s *Store) ReadJSON(path string, value any) error {
@@ -232,4 +281,12 @@ func samePath(a string, b string) bool {
 		return strings.EqualFold(filepath.Clean(aa), filepath.Clean(bb))
 	}
 	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func lockKey(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return strings.ToLower(filepath.Clean(abs))
 }
