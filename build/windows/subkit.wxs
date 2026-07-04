@@ -48,29 +48,6 @@
               KeyPath="yes"
             />
           </Component>
-
-          <Component
-            Id="PathEnvironment"
-            Guid="40f43ff6-1981-408a-8658-f9dbb3ff3175"
-            Win64="yes">
-            <RegistryValue
-              Root="HKLM"
-              Key="Software\AndreSantos\{{ .ProjectName }}"
-              Name="InstallDir"
-              Type="string"
-              Value="[INSTALLFOLDER]"
-              KeyPath="yes"
-            />
-            <Environment
-              Id="AddInstallFolderToPath"
-              Name="PATH"
-              Value="[INSTALLFOLDER]"
-              Permanent="no"
-              Part="last"
-              Action="set"
-              System="yes"
-            />
-          </Component>
         </Directory>
       </Directory>
     </Directory>
@@ -80,7 +57,6 @@
       Title="{{ .ProjectName }}"
       Level="1">
       <ComponentRef Id="MainExecutable" />
-      <ComponentRef Id="PathEnvironment" />
     </Feature>
   </Product>
 </Wix>
