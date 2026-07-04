@@ -1,0 +1,4 @@
+bin/
+*.exe
+.subkit-cache/
+data/
