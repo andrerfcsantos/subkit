@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <?define Manufacturer = "Andr&#233; Santos" ?>
+  <?define ProgramFilesFolder = "ProgramFiles64Folder" ?>
+
+  <Product
+    Name="{{ .ProjectName }}"
+    Id="*"
+    UpgradeCode="bd7e6d32-d775-4dee-974d-1e8990a2ec85"
+    Language="1033"
+    Codepage="1252"
+    Version="{{ .RawVersion }}"
+    Manufacturer="$(var.Manufacturer)">
+    <Package
+      Id="*"
+      Keywords="Installer"
+      Description="{{ .ProjectName }} installer"
+      Manufacturer="$(var.Manufacturer)"
+      InstallerVersion="500"
+      Languages="1033"
+      Compressed="yes"
+      InstallScope="perMachine"
+      SummaryCodepage="1252"
+    />
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of {{ .ProjectName }} is already installed."
+    />
+
+    <Media
+      Id="1"
+      Cabinet="{{ .ProjectName }}.cab"
+      EmbedCab="yes"
+    />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="$(var.ProgramFilesFolder)">
+        <Directory Id="INSTALLFOLDER" Name="{{ .ProjectName }}">
+          <Component
+            Id="MainExecutable"
+            Guid="3362d212-abf2-404c-9631-1e0f4f2746c0"
+            Win64="yes">
+            <File
+              Id="{{ .Binary }}Exe"
+              Name="{{ .Binary }}.exe"
+              DiskId="1"
+              Source="{{ .Binary }}.exe"
+              KeyPath="yes"
+            />
+          </Component>
+
+          <Component
+            Id="PathEnvironment"
+            Guid="40f43ff6-1981-408a-8658-f9dbb3ff3175"
+            Win64="yes">
+            <RegistryValue
+              Root="HKLM"
+              Key="Software\AndreSantos\{{ .ProjectName }}"
+              Name="InstallDir"
+              Type="string"
+              Value="[INSTALLFOLDER]"
+              KeyPath="yes"
+            />
+            <Environment
+              Id="AddInstallFolderToPath"
+              Name="PATH"
+              Value="[INSTALLFOLDER]"
+              Permanent="no"
+              Part="last"
+              Action="set"
+              System="yes"
+            />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature
+      Id="Complete"
+      Title="{{ .ProjectName }}"
+      Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="PathEnvironment" />
+    </Feature>
+  </Product>
+</Wix>

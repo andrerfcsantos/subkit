@@ -43,6 +43,28 @@ archives:
     files:
       - README.md
 
+msi:
+  - id: subkit
+    ids:
+      - subkit
+    name: "{{ .ProjectName }}_{{ .Version }}_windows_{{ .MsiArch }}"
+    wxs: ./build/windows/subkit.wxs
+    replace: false
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    version: v3
+
+dmg:
+  - id: subkit
+    ids:
+      - subkit
+    name: "{{ .ProjectName }}_{{ .Version }}_darwin_{{ .Arch }}"
+    use: binary
+    if: '{{ eq .Os "darwin" }}'
+    extra_files:
+      - README.md
+    replace: false
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
 release:
   github:
     owner: andrerfcsantos
