@@ -192,6 +192,7 @@ func NewRootCommand() *cobra.Command {
 	renderCmd.Flags().StringVar(&outputDir, "output-dir", "", "directory for generated output files")
 	root.AddCommand(renderCmd)
 
+	root.AddCommand(versionCommand())
 	root.AddCommand(cacheCommand(&opts))
 	return root
 }

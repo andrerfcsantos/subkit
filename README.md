@@ -23,6 +23,8 @@ subkit transcribe <media-file> [media-file...]
 subkit cues <media-file> [media-file...]
 subkit render <media-file> [media-file...] --output subtitle:srt
 
+subkit version [--verbose]
+
 subkit cache path
 subkit cache list
 subkit cache clean
