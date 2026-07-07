@@ -76,6 +76,48 @@ type batchEvent struct {
 	Stage   pipeline.Stage
 	Message string
 	Err     error
+
+	// Detail and Cached are only populated on the terminal StageDone event and
+	// are consumed exclusively by the TUI reporter. Detail is a human summary of
+	// the outcome (e.g. "wrote clip.srt", "wrote 2 files", "cached"); Cached is
+	// true when nothing new was written for the file (every output was already
+	// up to date). Message is left untouched so the plain reporter is unaffected.
+	Detail string
+	Cached bool
+}
+
+// summarizeOutputs derives a short outcome description and whether the file was
+// effectively skipped (all outputs already cached) from the results a worker
+// produced. This is the structural signal for "processed vs cached", replacing
+// any guessing from free-text stage messages.
+func summarizeOutputs(outputs []outputResult) (detail string, cached bool) {
+	if len(outputs) == 0 {
+		return "done", false
+	}
+
+	written := 0
+	artifactOnly := 0
+	var writtenPath string
+	for _, output := range outputs {
+		switch {
+		case output.Copied || output.ForceWrote:
+			written++
+			writtenPath = output.Path
+		case output.ArtifactOnly:
+			artifactOnly++
+		}
+	}
+
+	switch {
+	case written == 0 && artifactOnly == len(outputs):
+		return "ready", true
+	case written == 0:
+		return "cached", true
+	case written == 1 && len(outputs) == 1:
+		return "wrote " + filepath.Base(writtenPath), false
+	default:
+		return fmt.Sprintf("wrote %d files", written), false
+	}
 }
 
 type batchReporter interface {
@@ -211,7 +253,7 @@ func runBatchWithProcessor(ctx context.Context, out io.Writer, opts pipeline.Opt
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	reporter := newBatchReporter(out, flags.Progress, jobs, cancel)
+	reporter := newBatchReporter(out, flags.Progress, jobs, flags.Concurrency, cancel)
 	reporterClosed := false
 	closeReporter := func() {
 		if reporterClosed {
@@ -257,7 +299,8 @@ func runBatchWithProcessor(ctx context.Context, out io.Writer, opts pipeline.Opt
 					}
 					continue
 				}
-				reporter.Report(batchEvent{Input: job.Input, Stage: pipeline.StageDone, Message: "done"})
+				detail, cached := summarizeOutputs(outputs)
+				reporter.Report(batchEvent{Input: job.Input, Stage: pipeline.StageDone, Message: "done", Detail: detail, Cached: cached})
 				resultCh <- fileResult{Input: job.Input, Outputs: outputs}
 			}
 		}()
@@ -382,7 +425,7 @@ func copyArtifactOutput(cachePath string, outputPath string, reporter pipeline.R
 	return outputResult{Path: outputPath, Copied: copied, ForceWrote: explicitOutput}, nil
 }
 
-func newBatchReporter(out io.Writer, mode string, jobs []batchJob, cancel context.CancelFunc) batchReporter {
+func newBatchReporter(out io.Writer, mode string, jobs []batchJob, concurrency int, cancel context.CancelFunc) batchReporter {
 	useTUI := false
 	switch mode {
 	case progressTUI:
@@ -391,7 +434,7 @@ func newBatchReporter(out io.Writer, mode string, jobs []batchJob, cancel contex
 		useTUI = len(jobs) > 1 && isTerminal(out)
 	}
 	if useTUI {
-		return newTUIBatchReporter(out, jobs, cancel)
+		return newTUIBatchReporter(out, jobs, concurrency, cancel)
 	}
 	if mode == progressOff {
 		return noopBatchReporter{}

@@ -46,6 +46,61 @@ func TestResolveInputsExpandsGlobsDeduplicatesAndPreservesOrder(t *testing.T) {
 	}
 }
 
+func TestSummarizeOutputs(t *testing.T) {
+	cases := []struct {
+		name       string
+		outputs    []outputResult
+		wantDetail string
+		wantCached bool
+	}{
+		{
+			name:       "no outputs",
+			outputs:    nil,
+			wantDetail: "done",
+			wantCached: false,
+		},
+		{
+			name:       "single written",
+			outputs:    []outputResult{{Path: filepath.Join("out", "clip.srt"), Copied: true}},
+			wantDetail: "wrote clip.srt",
+			wantCached: false,
+		},
+		{
+			name:       "single force-written",
+			outputs:    []outputResult{{Path: "clip.srt", ForceWrote: true}},
+			wantDetail: "wrote clip.srt",
+			wantCached: false,
+		},
+		{
+			name:       "single cached",
+			outputs:    []outputResult{{Path: "clip.srt"}},
+			wantDetail: "cached",
+			wantCached: true,
+		},
+		{
+			name:       "mixed counts as written",
+			outputs:    []outputResult{{Path: "a.srt", Copied: true}, {Path: "b.vtt"}},
+			wantDetail: "wrote 1 files",
+			wantCached: false,
+		},
+		{
+			name:       "artifact only is ready",
+			outputs:    []outputResult{{Path: "cache/audio.wav", ArtifactOnly: true}},
+			wantDetail: "ready",
+			wantCached: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			detail, cached := summarizeOutputs(tc.outputs)
+			if detail != tc.wantDetail || cached != tc.wantCached {
+				t.Fatalf("summarizeOutputs = (%q, %v), want (%q, %v)", detail, cached, tc.wantDetail, tc.wantCached)
+			}
+		})
+	}
+}
+
 func TestResolveInputsRejectsUnmatchedGlobAndDirectories(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := resolveInputs([]string{filepath.Join(dir, "*.mp4")}); err == nil {
