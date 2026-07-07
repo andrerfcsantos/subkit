@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestProgressModelUpdatesRowsFromEvents(t *testing.T) {
@@ -22,7 +22,7 @@ func TestProgressModelUpdatesRowsFromEvents(t *testing.T) {
 	if row.Stage != pipeline.StageTranscribe || row.Message != "calling Deepgram" {
 		t.Fatalf("row = %#v", row)
 	}
-	view := got.View()
+	view := got.View().Content
 	if !strings.Contains(view, "movie.mp4") || !strings.Contains(view, "calling Deepgram") {
 		t.Fatalf("view missing row update: %q", view)
 	}
@@ -47,7 +47,7 @@ func TestProgressModelCancelKeyCancelsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	model := newProgressModel([]batchJob{{Input: "movie.mp4"}}, cancel)
 
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Text: "q", Code: 'q'}))
 	select {
 	case <-ctx.Done():
 	default:
