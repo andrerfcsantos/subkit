@@ -194,6 +194,7 @@ func NewRootCommand() *cobra.Command {
 
 	root.AddCommand(versionCommand())
 	root.AddCommand(cacheCommand(&opts))
+	root.AddCommand(newCheckVideoErrorsCommand())
 	return root
 }
 
