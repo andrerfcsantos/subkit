@@ -26,18 +26,22 @@ const (
 type VideoCheckStatus string
 
 const (
-	VideoStatusLikelyOK     VideoCheckStatus = "LIKELY_OK"
-	VideoStatusOK           VideoCheckStatus = "OK"
-	VideoStatusCorrupt      VideoCheckStatus = "CORRUPT"
-	VideoStatusUnreadable   VideoCheckStatus = "UNREADABLE"
-	VideoStatusInconclusive VideoCheckStatus = "INCONCLUSIVE"
+	VideoStatusLikelyOK      VideoCheckStatus = "LIKELY_OK"
+	VideoStatusOK            VideoCheckStatus = "OK"
+	VideoStatusNonconformant VideoCheckStatus = "NONCONFORMANT"
+	VideoStatusCorrupt       VideoCheckStatus = "CORRUPT"
+	VideoStatusTruncated     VideoCheckStatus = "TRUNCATED"
+	VideoStatusUnreadable    VideoCheckStatus = "UNREADABLE"
+	VideoStatusInconclusive  VideoCheckStatus = "INCONCLUSIVE"
 )
 
 type VideoCheckOptions struct {
 	Mode            VideoCheckMode
 	Samples         int
+	SampleSeconds   float64
 	TailSeconds     float64
 	Locate          bool
+	StrictBitstream bool
 	Resolution      float64
 	Timeout         time.Duration
 	FullTimeout     time.Duration
@@ -51,6 +55,7 @@ func DefaultVideoCheckOptions() VideoCheckOptions {
 	return VideoCheckOptions{
 		Mode:            VideoCheckQuick,
 		Samples:         3,
+		SampleSeconds:   1,
 		TailSeconds:     2,
 		Locate:          true,
 		Resolution:      0.25,
@@ -71,13 +76,15 @@ type VideoCheckEvent struct {
 type VideoCheckReporter func(VideoCheckEvent)
 
 type VideoDecodeCheck struct {
-	Kind             string   `json:"kind"`
-	StartSeconds     float64  `json:"start_seconds"`
-	RequestedSeconds *float64 `json:"requested_seconds,omitempty"`
-	State            string   `json:"state"`
-	Frames           int      `json:"frames"`
-	ElapsedSeconds   float64  `json:"elapsed_seconds"`
-	Detail           string   `json:"detail,omitempty"`
+	Kind              string   `json:"kind"`
+	StartSeconds      float64  `json:"start_seconds"`
+	RequestedSeconds  *float64 `json:"requested_seconds,omitempty"`
+	LastOutputSeconds *float64 `json:"last_output_seconds,omitempty"`
+	StrictBitstream   bool     `json:"strict_bitstream,omitempty"`
+	State             string   `json:"state"`
+	Frames            int      `json:"frames"`
+	ElapsedSeconds    float64  `json:"elapsed_seconds"`
+	Detail            string   `json:"detail,omitempty"`
 }
 
 type VideoCheckResult struct {
@@ -95,7 +102,11 @@ type VideoCheckResult struct {
 }
 
 func (r VideoCheckResult) Valid() bool {
-	return r.Status == VideoStatusOK || r.Status == VideoStatusLikelyOK
+	return r.Status == VideoStatusOK || r.Status == VideoStatusLikelyOK || r.Status == VideoStatusNonconformant
+}
+
+func (r VideoCheckResult) TimedOut() bool {
+	return slices.ContainsFunc(r.Checks, func(check VideoDecodeCheck) bool { return check.State == checkTimeout })
 }
 
 type videoMetadata struct {
@@ -114,14 +125,16 @@ type toolResult struct {
 }
 
 const (
-	checkPassed       = "passed"
-	checkFailed       = "failed"
-	checkTimeout      = "timeout"
-	checkInconclusive = "inconclusive"
-	checkCancelled    = "cancelled"
+	checkPassed        = "passed"
+	checkFailed        = "failed"
+	checkTimeout       = "timeout"
+	checkInconclusive  = "inconclusive"
+	checkNonconformant = "nonconformant"
+	checkCancelled     = "cancelled"
 )
 
 var framePattern = regexp.MustCompile(`(?m)^frame=(\d+)\r?$`)
+var outputTimePattern = regexp.MustCompile(`(?m)^out_time_us=(\d+)\r?$`)
 
 func CheckVideo(ctx context.Context, path string, opts VideoCheckOptions, reporter VideoCheckReporter) (VideoCheckResult, error) {
 	started := time.Now()
@@ -160,9 +173,13 @@ func CheckVideo(ctx context.Context, path string, opts VideoCheckOptions, report
 		case checkPassed:
 			result.Status = VideoStatusOK
 			result.Reason = "entire primary video stream decoded without a reported error"
+		case checkNonconformant:
+			result.Status = VideoStatusNonconformant
+			result.Reason = check.Detail
 		case checkFailed:
 			result.Status = VideoStatusCorrupt
 			result.Reason = check.Detail
+			setProgressFailureEstimate(&result, check)
 		default:
 			result.Status = VideoStatusInconclusive
 			result.Reason = check.Detail
@@ -181,27 +198,58 @@ func CheckVideo(ctx context.Context, path string, opts VideoCheckOptions, report
 	if tail.State == checkFailed {
 		result.Status = VideoStatusCorrupt
 		result.Reason = tail.Detail
+		if setProgressFailureEstimate(&result, tail) {
+			return finish(), nil
+		}
 		if opts.Locate && metadata.durationSeconds > opts.Resolution {
-			reportVideoCheck(reporter, "locate", "locating persistent corruption boundary")
-			estimate, note, err := locateVideoSuffixFailure(ctx, path, *metadata, opts, tailSeconds, &result.Checks, reporter)
+			reportVideoCheck(reporter, "locate", "locating last decodable window")
+			estimate, note, conclusive, err := locateLastDecodableBoundary(ctx, path, *metadata, opts, tailStart, &result.Checks, reporter)
 			if err != nil {
 				return finish(), err
 			}
 			result.FailureEstimateSeconds = estimate
 			result.EstimateNote = note
+			if !conclusive {
+				result.Status = VideoStatusInconclusive
+			}
 		}
 		return finish(), nil
 	}
-	if tail.State != checkPassed {
+	if tail.State == checkInconclusive && tail.Frames == 0 {
+		result.Reason = fmt.Sprintf("no video frame was produced in the declared final %.2fs", tailSeconds)
+		if opts.Locate && metadata.durationSeconds > opts.Resolution {
+			reportVideoCheck(reporter, "locate", "locating last decodable window after empty tail")
+			estimate, note, conclusive, err := locateLastDecodableBoundary(ctx, path, *metadata, opts, tailStart, &result.Checks, reporter)
+			if err != nil {
+				return finish(), err
+			}
+			result.FailureEstimateSeconds = estimate
+			result.EstimateNote = note
+			if conclusive {
+				result.Status = VideoStatusTruncated
+				result.Reason += "; decodable video appears to end before the advertised duration"
+				return finish(), nil
+			}
+		}
+		result.Status = VideoStatusInconclusive
+		return finish(), nil
+	}
+	if !decodeCheckPassed(tail) {
 		result.Status = VideoStatusInconclusive
 		result.Reason = tail.Detail
 		return finish(), nil
+	}
+	hadStrictWarning := tail.State == checkNonconformant
+	var strictWarnings []string
+	if hadStrictWarning {
+		strictWarnings = append(strictWarnings, tail.Detail)
 	}
 
 	points := videoSparsePoints(metadata.durationSeconds, tailStart, opts.Samples)
 	for i, point := range points {
 		reportVideoCheck(reporter, "sample", fmt.Sprintf("checking interior sample %d/%d", i+1, len(points)))
-		check, err := runDecodeCheck(ctx, path, *metadata, opts, "interior-sample", point, nil, true, opts.Timeout)
+		sampleSeconds := math.Min(opts.SampleSeconds, math.Max(0, tailStart-point))
+		check, err := runDecodeCheck(ctx, path, *metadata, opts, "interior-sample", point, &sampleSeconds, false, opts.Timeout)
 		if err != nil {
 			return finish(), err
 		}
@@ -209,21 +257,46 @@ func CheckVideo(ctx context.Context, path string, opts VideoCheckOptions, report
 		if check.State == checkFailed {
 			result.Status = VideoStatusCorrupt
 			result.Reason = check.Detail
-			estimate := point
-			result.FailureEstimateSeconds = &estimate
-			result.EstimateNote = "corruption was detected near this sampled seek/GOP; this is not necessarily the first damaged frame"
+			if !setProgressFailureEstimate(&result, check) {
+				estimate := point
+				result.FailureEstimateSeconds = &estimate
+				result.EstimateNote = "failure was detected in this sampled decode window; this is not necessarily the first damaged frame"
+			}
 			return finish(), nil
 		}
-		if check.State != checkPassed {
+		if !decodeCheckPassed(check) {
 			result.Status = VideoStatusInconclusive
 			result.Reason = check.Detail
 			return finish(), nil
 		}
+		if check.State == checkNonconformant {
+			hadStrictWarning = true
+			strictWarnings = append(strictWarnings, check.Detail)
+		}
 	}
 
+	if hadStrictWarning {
+		result.Status = VideoStatusNonconformant
+		result.Reason = strings.Join(strictWarnings, " | ")
+		return finish(), nil
+	}
 	result.Status = VideoStatusLikelyOK
-	result.Reason = fmt.Sprintf("tail and %d interior sample(s) decoded cleanly; unsampled regions were not read", len(points))
+	result.Reason = fmt.Sprintf("tail and %d interior %.2fs sample(s) decoded cleanly; unsampled regions were not read", len(points), opts.SampleSeconds)
 	return finish(), nil
+}
+
+func decodeCheckPassed(check VideoDecodeCheck) bool {
+	return check.State == checkPassed || check.State == checkNonconformant
+}
+
+func setProgressFailureEstimate(result *VideoCheckResult, check VideoDecodeCheck) bool {
+	if check.LastOutputSeconds == nil {
+		return false
+	}
+	estimate := *check.LastOutputSeconds
+	result.FailureEstimateSeconds = &estimate
+	result.EstimateNote = "last successfully emitted video timestamp before FFmpeg stopped; the failing packet is at or shortly after this point"
+	return true
 }
 
 func validateVideoCheckOptions(opts *VideoCheckOptions) error {
@@ -236,8 +309,8 @@ func validateVideoCheckOptions(opts *VideoCheckOptions) error {
 	if opts.Samples < 0 {
 		return fmt.Errorf("video check samples must be at least 0")
 	}
-	if opts.TailSeconds <= 0 {
-		return fmt.Errorf("video check tail seconds must be greater than 0")
+	if opts.SampleSeconds <= 0 || opts.TailSeconds <= 0 {
+		return fmt.Errorf("video check sample and tail seconds must be greater than 0")
 	}
 	if opts.Resolution <= 0 {
 		return fmt.Errorf("video check resolution must be greater than 0")
@@ -317,9 +390,9 @@ func readVideoMetadata(ctx context.Context, path string, opts VideoCheckOptions)
 		return nil, "no non-thumbnail video stream found", nil
 	}
 
-	duration, ok := positiveVideoFloat(payload.Format.Duration)
+	duration, ok := positiveVideoFloat(streamDuration)
 	if !ok {
-		duration, ok = positiveVideoFloat(streamDuration)
+		duration, ok = positiveVideoFloat(payload.Format.Duration)
 	}
 	if !ok {
 		return nil, "container does not expose a usable duration", nil
@@ -345,14 +418,43 @@ func positiveVideoFloat(value string) (float64, bool) {
 }
 
 func runDecodeCheck(ctx context.Context, path string, metadata videoMetadata, opts VideoCheckOptions, kind string, start float64, duration *float64, oneFrame bool, timeout time.Duration) (VideoDecodeCheck, error) {
+	check, err := runDecodeAttempt(ctx, path, metadata, opts, kind, start, duration, oneFrame, timeout, opts.StrictBitstream)
+	if err != nil || !opts.StrictBitstream || check.State != checkFailed {
+		return check, err
+	}
+
+	practical, err := runDecodeAttempt(ctx, path, metadata, opts, kind+"-practical-retry", start, duration, oneFrame, timeout, false)
+	if err != nil {
+		return practical, err
+	}
+	check.ElapsedSeconds += practical.ElapsedSeconds
+	if decodeCheckPassed(practical) {
+		check.State = checkNonconformant
+		check.Frames = practical.Frames
+		check.LastOutputSeconds = practical.LastOutputSeconds
+		check.Detail = "strict bitstream validation failed but practical decoding succeeded: " + check.Detail
+		return check, nil
+	}
+	if practical.State != checkFailed {
+		practical.Detail = "strict bitstream validation failed and the practical retry was inconclusive: " + practical.Detail
+		return practical, nil
+	}
+	return check, nil
+}
+
+func runDecodeAttempt(ctx context.Context, path string, metadata videoMetadata, opts VideoCheckOptions, kind string, start float64, duration *float64, oneFrame bool, timeout time.Duration, strict bool) (VideoDecodeCheck, error) {
 	args := []string{
 		"-hide_banner", "-nostdin", "-loglevel", "error", "-xerror",
-		"-err_detect", "explode",
+	}
+	if strict {
+		args = append(args, "-err_detect", "explode")
+	}
+	args = append(args,
 		"-ss", fmt.Sprintf("%.6f", math.Max(0, start)),
 		"-i", path,
 		"-map", fmt.Sprintf("0:%d", metadata.videoStreamIndex),
 		"-an", "-sn", "-dn",
-	}
+	)
 	if duration != nil {
 		args = append(args, "-t", fmt.Sprintf("%.6f", *duration))
 	}
@@ -362,12 +464,18 @@ func runDecodeCheck(ctx context.Context, path string, metadata videoMetadata, op
 	args = append(args, "-progress", "pipe:1", "-nostats", "-f", "null", os.DevNull)
 
 	command := runVideoTool(ctx, timeout, opts.FFmpegPath, args...)
+	frames, relativeOutput := decodedProgress(command.stdout)
 	check := VideoDecodeCheck{
 		Kind:             kind,
 		StartSeconds:     math.Max(0, start),
 		RequestedSeconds: duration,
-		Frames:           decodedFrameCount(command.stdout),
+		StrictBitstream:  strict,
+		Frames:           frames,
 		ElapsedSeconds:   command.elapsed.Seconds(),
+	}
+	if relativeOutput != nil {
+		absolute := check.StartSeconds + *relativeOutput
+		check.LastOutputSeconds = &absolute
 	}
 	switch {
 	case ctx.Err() != nil:
@@ -376,13 +484,13 @@ func runDecodeCheck(ctx context.Context, path string, metadata videoMetadata, op
 		return check, ctx.Err()
 	case command.timedOut:
 		check.State = checkTimeout
-		check.Detail = fmt.Sprintf("decode exceeded %s", timeout)
+		check.Detail = fmt.Sprintf("%s decode exceeded %s after producing %d frame(s)", kind, timeout, check.Frames)
 	case command.err != nil:
 		check.State = checkFailed
 		check.Detail = conciseVideoError(command.stderr)
 	case check.Frames == 0:
 		check.State = checkInconclusive
-		check.Detail = "decode completed but produced no video frame"
+		check.Detail = fmt.Sprintf("%s decode completed but produced no video frame", kind)
 	default:
 		check.State = checkPassed
 	}
@@ -409,7 +517,7 @@ func runVideoTool(ctx context.Context, timeout time.Duration, executable string,
 	}
 }
 
-func decodedFrameCount(output string) int {
+func decodedProgress(output string) (int, *float64) {
 	maxFrames := 0
 	for _, match := range framePattern.FindAllStringSubmatch(output, -1) {
 		value, err := strconv.Atoi(match[1])
@@ -417,7 +525,19 @@ func decodedFrameCount(output string) int {
 			maxFrames = value
 		}
 	}
-	return maxFrames
+	var maxOutput float64
+	foundOutput := false
+	for _, match := range outputTimePattern.FindAllStringSubmatch(output, -1) {
+		value, err := strconv.ParseInt(match[1], 10, 64)
+		if err == nil && (!foundOutput || float64(value)/1_000_000 > maxOutput) {
+			maxOutput = float64(value) / 1_000_000
+			foundOutput = true
+		}
+	}
+	if !foundOutput {
+		return maxFrames, nil
+	}
+	return maxFrames, &maxOutput
 }
 
 func conciseVideoError(stderr string) string {
@@ -430,7 +550,7 @@ func conciseVideoError(stderr string) string {
 	if len(lines) == 0 {
 		return "FFmpeg returned an error without a diagnostic message"
 	}
-	terms := []string{"invalid", "corrupt", "error splitting", "error while decoding", "partial file", "missing picture", "failed to"}
+	terms := []string{"could not find ref", "constructing the frame", "invalid", "corrupt", "error splitting", "error while decoding", "partial file", "missing picture", "failed to"}
 	var selected []string
 	for _, line := range lines {
 		lower := strings.ToLower(line)
@@ -448,7 +568,7 @@ func conciseVideoError(stderr string) string {
 		}
 	}
 	last := lines[len(lines)-1]
-	if !slices.Contains(selected, last) && !strings.Contains(strings.ToLower(last), "nothing was written") {
+	if len(selected) < 2 && !slices.Contains(selected, last) && !strings.Contains(strings.ToLower(last), "nothing was written") {
 		selected = append(selected, last)
 	}
 	message := strings.Join(selected, " | ")
@@ -476,63 +596,42 @@ func videoSparsePoints(duration float64, tailStart float64, count int) []float64
 	return points
 }
 
-func locateVideoSuffixFailure(ctx context.Context, path string, metadata videoMetadata, opts VideoCheckOptions, tailSeconds float64, checks *[]VideoDecodeCheck, reporter VideoCheckReporter) (*float64, string, error) {
-	distances := []float64{0.10, 0.25, 0.50, 1.0, tailSeconds / 2, tailSeconds}
-	var candidates []float64
-	for _, distance := range distances {
-		point := math.Max(0, metadata.durationSeconds-distance)
-		if !slices.ContainsFunc(candidates, func(existing float64) bool { return math.Abs(point-existing) <= 0.01 }) {
-			candidates = append(candidates, point)
-		}
-	}
-
-	badPoint := -1.0
-	for _, point := range candidates {
-		check, err := runDecodeCheck(ctx, path, metadata, opts, "locator-endpoint", point, nil, true, opts.Timeout)
-		if err != nil {
-			return nil, "", err
-		}
+func locateLastDecodableBoundary(ctx context.Context, path string, metadata videoMetadata, opts VideoCheckOptions, badPoint float64, checks *[]VideoDecodeCheck, reporter VideoCheckReporter) (*float64, string, bool, error) {
+	windowAt := func(kind string, point float64) (VideoDecodeCheck, error) {
+		duration := math.Min(opts.SampleSeconds, math.Max(0.001, metadata.durationSeconds-point))
+		check, err := runDecodeCheck(ctx, path, metadata, opts, kind, point, &duration, false, opts.Timeout)
 		*checks = append(*checks, check)
-		if check.State == checkFailed {
-			badPoint = point
-			break
-		}
-	}
-	if badPoint < 0 {
-		return nil, "tail decode failed, but single-frame probes near the end did not; the error may be isolated or seek-dependent", nil
+		return check, err
 	}
 
-	startCheck, err := runDecodeCheck(ctx, path, metadata, opts, "locator-start", 0, nil, true, opts.Timeout)
+	startCheck, err := windowAt("locator-start-window", 0)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
-	*checks = append(*checks, startCheck)
-	if startCheck.State != checkPassed {
-		zero := 0.0
-		return &zero, "the first independently decoded frame also fails", nil
+	if !decodeCheckPassed(startCheck) {
+		return nil, fmt.Sprintf("localization unavailable because the startup window was %s: %s", startCheck.State, startCheck.Detail), false, nil
 	}
 
-	good, bad := 0.0, badPoint
+	good, bad := 0.0, math.Max(opts.Resolution, badPoint)
 	for bad-good > opts.Resolution {
 		midpoint := (good + bad) / 2
-		reportVideoCheck(reporter, "locate", fmt.Sprintf("probing near %s", FormatVideoTimestamp(midpoint)))
-		check, err := runDecodeCheck(ctx, path, metadata, opts, "locator-bisection", midpoint, nil, true, opts.Timeout)
+		reportVideoCheck(reporter, "locate", fmt.Sprintf("probing %.2fs window near %s", opts.SampleSeconds, FormatVideoTimestamp(midpoint)))
+		check, err := windowAt("locator-window", midpoint)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		*checks = append(*checks, check)
-		switch check.State {
-		case checkFailed:
-			bad = midpoint
-		case checkPassed:
+		switch {
+		case decodeCheckPassed(check):
 			good = midpoint
+		case check.State == checkFailed || (check.State == checkInconclusive && check.Frames == 0):
+			bad = midpoint
 		default:
 			estimate := bad
-			return &estimate, fmt.Sprintf("localization became %s at %s; last known-good seek is %s", check.State, FormatVideoTimestamp(midpoint), FormatVideoTimestamp(good)), nil
+			return &estimate, fmt.Sprintf("localization stopped when the window at %s became %s; last known-good window starts at %s", FormatVideoTimestamp(midpoint), check.State, FormatVideoTimestamp(good)), false, nil
 		}
 	}
 	estimate := bad
-	return &estimate, fmt.Sprintf("approximate first failing seek/GOP; last known-good seek is %s (+/-%.3gs). This assumes corruption persists from the boundary to the end", FormatVideoTimestamp(good), opts.Resolution), nil
+	return &estimate, fmt.Sprintf("approximate first failing decode window; last known-good %.2fs window starts at %s (+/-%.3gs). This estimate assumes failures persist to the declared end", opts.SampleSeconds, FormatVideoTimestamp(good), opts.Resolution), true, nil
 }
 
 func FormatVideoTimestamp(seconds float64) string {

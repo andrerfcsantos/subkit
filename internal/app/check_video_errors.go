@@ -32,6 +32,8 @@ type checkVideoFlags struct {
 	CSVReport      string
 	Concurrency    int
 	Progress       string
+	ShowOK         bool
+	RetryTimeouts  bool
 	NoLocate       bool
 	Timeout        float64
 	FullTimeout    float64
@@ -47,14 +49,23 @@ type indexedVideoResult struct {
 type videoChecker func(context.Context, string, media.VideoCheckOptions, media.VideoCheckReporter) (media.VideoCheckResult, error)
 
 type videoCheckBatchError struct {
-	Problematic int
+	Confirmed   int
+	RetryNeeded int
 }
 
 func (e videoCheckBatchError) Error() string {
-	if e.Problematic == 1 {
-		return "1 video has errors or could not be checked"
+	var parts []string
+	if e.Confirmed == 1 {
+		parts = append(parts, "1 video has a confirmed issue")
+	} else if e.Confirmed > 1 {
+		parts = append(parts, fmt.Sprintf("%d videos have confirmed issues", e.Confirmed))
 	}
-	return fmt.Sprintf("%d videos have errors or could not be checked", e.Problematic)
+	if e.RetryNeeded == 1 {
+		parts = append(parts, "1 video remains inconclusive after retry")
+	} else if e.RetryNeeded > 1 {
+		parts = append(parts, fmt.Sprintf("%d videos remain inconclusive after retry", e.RetryNeeded))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func newCheckVideoErrorsCommand() *cobra.Command {
@@ -65,6 +76,7 @@ func newCheckVideoErrorsCommand() *cobra.Command {
 		Extensions:     defaultVideoExtensions,
 		Concurrency:    defaultConcurrency,
 		Progress:       progressAuto,
+		RetryTimeouts:  true,
 		Timeout:        defaults.Timeout.Seconds(),
 		FullTimeout:    defaults.FullTimeout.Seconds(),
 		AnalyzeSeconds: defaults.AnalyzeDuration.Seconds(),
@@ -89,8 +101,10 @@ func newCheckVideoErrorsCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&flags.Mode, "mode", flags.Mode, "scan mode: quick or full")
-	cmd.Flags().IntVar(&flags.Options.Samples, "samples", flags.Options.Samples, "interior one-frame samples after a clean tail; 0 checks only the tail")
+	cmd.Flags().IntVar(&flags.Options.Samples, "samples", flags.Options.Samples, "interior decode windows after a clean tail; 0 checks only the tail")
+	cmd.Flags().Float64Var(&flags.Options.SampleSeconds, "sample-seconds", flags.Options.SampleSeconds, "seconds decoded at each interior sample and locator probe")
 	cmd.Flags().Float64Var(&flags.Options.TailSeconds, "tail-seconds", flags.Options.TailSeconds, "seconds to decode at the end of each video")
+	cmd.Flags().BoolVar(&flags.Options.StrictBitstream, "strict-bitstream", false, "also run strict bitstream validation; recoverable failures are warnings")
 	cmd.Flags().BoolVar(&flags.Options.Locate, "locate", flags.Options.Locate, "locate a persistent-to-EOF failure")
 	cmd.Flags().BoolVar(&flags.NoLocate, "no-locate", false, "disable persistent failure localization")
 	cmd.Flags().Float64Var(&flags.Options.Resolution, "resolution", flags.Options.Resolution, "failure localization resolution in seconds")
@@ -98,6 +112,8 @@ func newCheckVideoErrorsCommand() *cobra.Command {
 	cmd.Flags().IntVar(&flags.Concurrency, "jobs", flags.Concurrency, "alias for --concurrency")
 	_ = cmd.Flags().MarkHidden("jobs")
 	cmd.Flags().StringVar(&flags.Progress, "progress", flags.Progress, "progress display: auto, tui, plain, or off")
+	cmd.Flags().BoolVar(&flags.ShowOK, "show-ok", false, "print successful per-file results in addition to problems and warnings")
+	cmd.Flags().BoolVar(&flags.RetryTimeouts, "retry-timeouts", flags.RetryTimeouts, "retry timed-out videos serially after the first pass")
 	cmd.Flags().Float64Var(&flags.Timeout, "timeout", flags.Timeout, "seconds allowed for each quick probe")
 	cmd.Flags().Float64Var(&flags.FullTimeout, "timeout-full", flags.FullTimeout, "seconds allowed per video in full mode")
 	cmd.Flags().IntVar(&flags.Options.ProbeSizeMiB, "probe-size-mib", flags.Options.ProbeSizeMiB, "maximum FFprobe probe size in MiB")
@@ -118,8 +134,8 @@ func prepareCheckVideoFlags(flags *checkVideoFlags) error {
 	if flags.Options.Samples < 0 {
 		return fmt.Errorf("--samples must be at least 0")
 	}
-	if flags.Options.TailSeconds <= 0 || flags.Options.Resolution <= 0 {
-		return fmt.Errorf("--tail-seconds and --resolution must be greater than 0")
+	if flags.Options.SampleSeconds <= 0 || flags.Options.TailSeconds <= 0 || flags.Options.Resolution <= 0 {
+		return fmt.Errorf("--sample-seconds, --tail-seconds, and --resolution must be greater than 0")
 	}
 	if flags.Concurrency < 1 {
 		return fmt.Errorf("--concurrency must be at least 1")
@@ -412,6 +428,30 @@ func runVideoChecksWithChecker(ctx context.Context, out io.Writer, flags checkVi
 		}
 		completed[item.index] = true
 	}
+	if flags.RetryTimeouts {
+		for i, result := range results {
+			if !completed[i] || !result.TimedOut() {
+				continue
+			}
+			input := inputs[i]
+			reporter.Report(batchEvent{Input: input, Stage: pipeline.Stage("retry"), Message: "retrying timed-out video with no competing decoder"})
+			retried, err := check(ctx, input, flags.Options, func(event media.VideoCheckEvent) {
+				reporter.Report(batchEvent{Input: input, Stage: pipeline.Stage(event.Stage), Message: event.Message})
+			})
+			if err != nil {
+				if retried.Path == "" {
+					retried = media.VideoCheckResult{Path: input, Status: media.VideoStatusInconclusive, Reason: err.Error()}
+				}
+				reporter.Report(batchEvent{Input: input, Stage: pipeline.StageFailed, Message: err.Error(), Err: err})
+			} else if retried.Valid() {
+				reporter.Report(batchEvent{Input: input, Stage: pipeline.StageDone, Message: "retry done", Detail: strings.ToLower(string(retried.Status))})
+			} else {
+				detail := videoResultSummary(retried)
+				reporter.Report(batchEvent{Input: input, Stage: pipeline.StageFailed, Message: detail, Err: fmt.Errorf("%s", detail)})
+			}
+			results[i] = retried
+		}
+	}
 	reporter.Close()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -424,7 +464,9 @@ func runVideoChecksWithChecker(ctx context.Context, out io.Writer, flags checkVi
 		}
 	}
 	for _, result := range finished {
-		printVideoResult(out, result)
+		if flags.ShowOK || !result.Valid() || result.Status == media.VideoStatusNonconformant {
+			printVideoResult(out, result)
+		}
 	}
 	if flags.JSONReport != "" {
 		if err := writeVideoJSONReport(flags.JSONReport, flags.Options.Mode, finished); err != nil {
@@ -440,16 +482,16 @@ func runVideoChecksWithChecker(ctx context.Context, out io.Writer, flags checkVi
 	}
 
 	counts := map[media.VideoCheckStatus]int{}
-	problematic := 0
 	for _, result := range finished {
 		counts[result.Status]++
-		if !result.Valid() {
-			problematic++
-		}
 	}
 	fmt.Fprintln(out, formatVideoCounts(counts))
-	if problematic > 0 {
-		return videoCheckBatchError{Problematic: problematic}
+	confirmed := counts[media.VideoStatusCorrupt] + counts[media.VideoStatusTruncated] + counts[media.VideoStatusUnreadable]
+	retryNeeded := counts[media.VideoStatusInconclusive]
+	warnings := counts[media.VideoStatusNonconformant]
+	fmt.Fprintf(out, "Outcome: confirmed_issues=%d, retry_needed=%d, warnings=%d\n", confirmed, retryNeeded, warnings)
+	if confirmed+retryNeeded > 0 {
+		return videoCheckBatchError{Confirmed: confirmed, RetryNeeded: retryNeeded}
 	}
 	return nil
 }
@@ -471,7 +513,7 @@ func printVideoResult(out io.Writer, result media.VideoCheckResult) {
 		label += " near " + media.FormatVideoTimestamp(*result.FailureEstimateSeconds)
 	}
 	fmt.Fprintln(out, label)
-	if !result.Valid() {
+	if !result.Valid() || result.Status == media.VideoStatusNonconformant {
 		fmt.Fprintf(out, "               %s\n", result.Reason)
 		if result.EstimateNote != "" {
 			fmt.Fprintf(out, "               %s\n", result.EstimateNote)
@@ -480,7 +522,7 @@ func printVideoResult(out io.Writer, result media.VideoCheckResult) {
 }
 
 func formatVideoCounts(counts map[media.VideoCheckStatus]int) string {
-	statuses := []media.VideoCheckStatus{media.VideoStatusOK, media.VideoStatusLikelyOK, media.VideoStatusCorrupt, media.VideoStatusUnreadable, media.VideoStatusInconclusive}
+	statuses := []media.VideoCheckStatus{media.VideoStatusOK, media.VideoStatusLikelyOK, media.VideoStatusNonconformant, media.VideoStatusCorrupt, media.VideoStatusTruncated, media.VideoStatusUnreadable, media.VideoStatusInconclusive}
 	var parts []string
 	for _, status := range statuses {
 		if count := counts[status]; count > 0 {
