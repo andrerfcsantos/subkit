@@ -69,3 +69,40 @@ release:
   github:
     owner: andrerfcsantos
     name: subkit
+
+winget:
+  - name: subkit
+    package_identifier: AndreSantos.Subkit
+    package_name: subkit
+    publisher: Andre Santos
+    publisher_url: https://github.com/andrerfcsantos
+    publisher_support_url: https://github.com/andrerfcsantos/subkit/issues
+    homepage: https://github.com/andrerfcsantos/subkit
+    license: MIT
+    license_url: https://github.com/andrerfcsantos/subkit/blob/main/LICENSE
+    copyright: Copyright (c) 2026 Andre Santos
+    short_description: CLI for generating subtitle and transcript artifacts from media files.
+    description: subkit is a Go CLI for generating subtitle and transcript artifacts from media files.
+    release_notes_url: https://github.com/andrerfcsantos/subkit/releases/tag/{{ .Tag }}
+    tags:
+      - subtitles
+      - transcript
+      - transcription
+      - cli
+      - media
+    use: archive
+    ids:
+      - subkit
+    repository:
+      owner: andrerfcsantos
+      name: winget-pkgs
+      branch: subkit-{{ .Version }}
+      token: "{{ .Env.WINGET_GITHUB_TOKEN }}"
+      token_type: github
+      pull_request:
+        enabled: true
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+        check_boxes: true
