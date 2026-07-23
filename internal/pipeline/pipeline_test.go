@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const (
@@ -200,6 +202,79 @@ func TestEnsureTranscriptCacheHitDoesNotExtractAudioAgain(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&requests); got != 1 {
 		t.Fatalf("Deepgram requests = %d, want 1", got)
+	}
+}
+
+func TestEnsureTranscriptReportsProviderWhileRequestIsInProgress(t *testing.T) {
+	dir := t.TempDir()
+	installPipelineFakeFFmpeg(t, dir)
+	input := writePipelineTestFile(t, filepath.Join(dir, "movie.mp4"))
+
+	requestStarted := make(chan struct{}, 1)
+	releaseRequest := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseRequest)
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		requestStarted <- struct{}{}
+		<-releaseRequest
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"metadata":{},"results":{"channels":[]}}`)
+	}))
+	defer server.Close()
+	defer release()
+
+	opts := DefaultOptions()
+	opts.Cache.Dir = filepath.Join(dir, "cache")
+	opts.Deepgram.Endpoint = server.URL
+	opts.Deepgram.APIKeyEnvName = "SUBKIT_PIPELINE_TEST_DEEPGRAM_KEY"
+	t.Setenv(opts.Deepgram.APIKeyEnvName, "test-key")
+
+	events := make(chan Event, 8)
+	runner, err := NewRunnerWithReporter(opts, ReporterFunc(func(event Event) {
+		events <- event
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = runner.Close()
+	}()
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := runner.EnsureTranscript(context.Background(), input)
+		result <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Deepgram request")
+	}
+
+	first := <-events
+	second := <-events
+	if first.Stage != StageAudio || first.Message != "extracting with ffmpeg" {
+		t.Fatalf("first event = %#v, want audio extraction", first)
+	}
+	if second.Stage != StageTranscribe || second.Message != "calling Deepgram" {
+		t.Fatalf("second event = %#v, want active Deepgram request", second)
+	}
+
+	release()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for transcript result")
 	}
 }
 

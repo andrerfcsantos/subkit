@@ -264,11 +264,11 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 		return artifact, &t, nil
 	}
 
-	r.report(StageTranscribe, "calling Deepgram")
 	audioArtifact, err := r.ensureAudio(ctx, audioIdentity)
 	if err != nil {
 		return Artifact{}, nil, err
 	}
+	r.report(StageTranscribe, "calling Deepgram")
 	client := deepgram.Client{}
 	contentType := media.AudioContentType(r.Opts.Audio.Format)
 	t, raw, err := client.TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
