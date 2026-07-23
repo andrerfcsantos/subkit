@@ -15,7 +15,19 @@ import (
 	"sync"
 )
 
-var pathLocks sync.Map
+// pathLocks serializes work on a cache path across every store in the
+// process. Entries are reference counted and removed once the last holder
+// releases them, so the table doesn't grow with each distinct path touched
+// over a long batch.
+var (
+	pathLocksMu sync.Mutex
+	pathLocks   = map[string]*pathLock{}
+)
+
+type pathLock struct {
+	mu   sync.Mutex
+	refs int
+}
 
 type Store struct {
 	Root    string
@@ -121,10 +133,27 @@ func (s *Store) Exists(path string) bool {
 }
 
 func (s *Store) LockPath(path string) func() {
-	value, _ := pathLocks.LoadOrStore(lockKey(path), &sync.Mutex{})
-	mu := value.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	key := lockKey(path)
+
+	pathLocksMu.Lock()
+	lock := pathLocks[key]
+	if lock == nil {
+		lock = &pathLock{}
+		pathLocks[key] = lock
+	}
+	lock.refs++
+	pathLocksMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		pathLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(pathLocks, key)
+		}
+		pathLocksMu.Unlock()
+	}
 }
 
 func (s *Store) EnsureDir(path string) error {
