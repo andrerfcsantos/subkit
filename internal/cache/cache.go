@@ -248,17 +248,25 @@ func CopyFileIfDifferent(src string, dst string) (bool, error) {
 		return false, nil
 	}
 
-	if _, err := os.Stat(dst); err == nil {
-		srcHash, err := FileSHA256(src)
+	if dstInfo, err := os.Stat(dst); err == nil {
+		srcInfo, err := os.Stat(src)
 		if err != nil {
 			return false, err
 		}
-		dstHash, err := FileSHA256(dst)
-		if err != nil {
-			return false, err
-		}
-		if srcHash == dstHash {
-			return false, nil
+		// Different sizes cannot be identical content, so skip the hashing and
+		// its two full-file reads.
+		if srcInfo.Size() == dstInfo.Size() {
+			srcHash, err := FileSHA256(src)
+			if err != nil {
+				return false, err
+			}
+			dstHash, err := FileSHA256(dst)
+			if err != nil {
+				return false, err
+			}
+			if srcHash == dstHash {
+				return false, nil
+			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
