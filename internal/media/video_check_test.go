@@ -128,8 +128,11 @@ func TestCheckVideoUsesProgressTimestampForFailureEstimate(t *testing.T) {
 
 func TestCheckVideoTimeoutNamesStageAndCanBeRetried(t *testing.T) {
 	path, opts := videoCheckFixture(t, 100)
-	opts.Timeout = 250 * time.Millisecond
-	t.Setenv("TEST_VIDEO_SLEEP_MS", "1000")
+	// The timeout must be generous enough for the fake ffprobe (which does not
+	// sleep) to start and answer even under the race detector's overhead, while
+	// the fake ffmpeg sleeps well past it to trip the decode timeout.
+	opts.Timeout = 2 * time.Second
+	t.Setenv("TEST_VIDEO_SLEEP_MS", "6000")
 
 	result, err := CheckVideo(context.Background(), path, opts, nil)
 	if err != nil {
