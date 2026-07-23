@@ -110,6 +110,9 @@ func cuesFromSegments(t transcript.Transcript, opts CueOptions) []Cue {
 func cuesFromWords(words []transcript.Word, opts CueOptions) []Cue {
 	var cues []Cue
 	var current []transcript.Word
+	// currentLen tracks the joined display length of current so measuring the
+	// next candidate doesn't re-join the whole cue for every word.
+	currentLen := 0
 	limit := opts.MaxCharsPerLine * opts.MaxLines
 
 	flush := func() {
@@ -130,6 +133,7 @@ func cuesFromWords(words []transcript.Word, opts CueOptions) []Cue {
 			Words:   wordIndexes(current),
 		})
 		current = nil
+		currentLen = 0
 	}
 
 	for _, word := range words {
@@ -138,11 +142,12 @@ func cuesFromWords(words []transcript.Word, opts CueOptions) []Cue {
 		}
 		if len(current) == 0 {
 			current = append(current, word)
+			currentLen = len(word.DisplayText())
 			continue
 		}
 
 		last := current[len(current)-1]
-		nextTextLen := len(wordsText(current)) + 1 + len(word.DisplayText())
+		nextTextLen := currentLen + 1 + len(word.DisplayText())
 		speakerChanged := speakerValue(last.Speaker) != speakerValue(word.Speaker)
 		gapTooLarge := word.Start-last.End > opts.MaxGap
 		durationTooLong := word.End-current[0].Start > opts.MaxDuration
@@ -151,8 +156,12 @@ func cuesFromWords(words []transcript.Word, opts CueOptions) []Cue {
 
 		if speakerChanged || gapTooLarge || durationTooLong || lineTooLong || sentenceBreak {
 			flush()
+			current = append(current, word)
+			currentLen = len(word.DisplayText())
+			continue
 		}
 		current = append(current, word)
+		currentLen = nextTextLen
 	}
 	flush()
 
