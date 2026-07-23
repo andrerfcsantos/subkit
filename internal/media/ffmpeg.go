@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type AudioOptions struct {
@@ -58,14 +59,28 @@ func ExtractAudio(ctx context.Context, input string, output string, opts AudioOp
 	return nil
 }
 
+var (
+	ffmpegVersionMu     sync.Mutex
+	ffmpegVersionCached string
+)
+
+// FFmpegVersion returns the first line of `ffmpeg -version`. The banner is
+// constant for the life of the process, so a successful lookup is memoized and
+// batches don't spawn ffmpeg once per file just to read it. Failures are not
+// cached, so a transient error doesn't poison later calls.
 func FFmpegVersion(ctx context.Context) string {
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-version")
-	out, err := cmd.Output()
+	ffmpegVersionMu.Lock()
+	defer ffmpegVersionMu.Unlock()
+	if ffmpegVersionCached != "" {
+		return ffmpegVersionCached
+	}
+	out, err := exec.CommandContext(ctx, "ffmpeg", "-version").Output()
 	if err != nil {
 		return "unknown"
 	}
 	firstLine, _, _ := strings.Cut(string(out), "\n")
-	return strings.TrimSpace(firstLine)
+	ffmpegVersionCached = strings.TrimSpace(firstLine)
+	return ffmpegVersionCached
 }
 
 func AudioContentType(format string) string {

@@ -49,6 +49,7 @@ type Runner struct {
 	audioMemo      *memoAudio
 	transcriptMemo *memoTranscript
 	cuesMemo       *memoCues
+	sourceHashes   map[string]string
 }
 
 type Artifact struct {
@@ -124,7 +125,7 @@ func (r *Runner) audioIdentity(ctx context.Context, mediaPath string) (audioIden
 	if err != nil {
 		return audioIdentity{}, err
 	}
-	sourceHash, err := cache.FileSHA256(absMediaPath)
+	sourceHash, err := r.sourceHash(absMediaPath)
 	if err != nil {
 		return audioIdentity{}, err
 	}
@@ -144,6 +145,24 @@ func (r *Runner) audioIdentity(ctx context.Context, mediaPath string) (audioIden
 		Key:       key,
 		Ext:       media.AudioExtension(r.Opts.Audio.Format),
 	}, nil
+}
+
+// sourceHash memoizes the SHA-256 of source media per absolute path so that
+// computing an artifact identity twice doesn't re-read a potentially large
+// file from disk.
+func (r *Runner) sourceHash(absMediaPath string) (string, error) {
+	if hash, ok := r.sourceHashes[absMediaPath]; ok {
+		return hash, nil
+	}
+	hash, err := cache.FileSHA256(absMediaPath)
+	if err != nil {
+		return "", err
+	}
+	if r.sourceHashes == nil {
+		r.sourceHashes = map[string]string{}
+	}
+	r.sourceHashes[absMediaPath] = hash
+	return hash, nil
 }
 
 func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, error) {
