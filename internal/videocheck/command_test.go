@@ -1,4 +1,4 @@
-package app
+package videocheck
 
 import (
 	"bytes"
@@ -10,27 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrerfcsantos/subkit-codex/internal/batch"
 	"github.com/andrerfcsantos/subkit-codex/internal/media"
 )
-
-func TestCheckVideoErrorsCommandIsHidden(t *testing.T) {
-	root := NewRootCommand()
-	command, _, err := root.Find([]string{"check-video-errors"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !command.Hidden {
-		t.Fatal("check-video-errors command should be hidden")
-	}
-	var help bytes.Buffer
-	root.SetOut(&help)
-	if err := root.Help(); err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(help.Bytes(), []byte("check-video-errors")) {
-		t.Fatal("hidden command appears in root help")
-	}
-}
 
 func TestResolveVideoCheckInputsSupportsGlobstarAndDeduplicates(t *testing.T) {
 	root := t.TempDir()
@@ -75,7 +57,7 @@ func TestRunVideoChecksHonorsConcurrency(t *testing.T) {
 		return media.VideoCheckResult{Path: path, Status: media.VideoStatusLikelyOK, Reason: "sampled"}, nil
 	}
 
-	flags := checkVideoFlags{Options: media.DefaultVideoCheckOptions(), Concurrency: 2, Progress: progressOff}
+	flags := checkVideoFlags{Options: media.DefaultVideoCheckOptions(), Concurrency: 2, Progress: batch.ProgressOff}
 	inputs := []string{"a.mp4", "b.mp4", "c.mp4", "d.mp4", "e.mp4"}
 	if err := runVideoChecksWithChecker(context.Background(), &bytes.Buffer{}, flags, inputs, checker); err != nil {
 		t.Fatal(err)
@@ -99,7 +81,7 @@ func TestRunVideoChecksRetriesTimeoutsSerially(t *testing.T) {
 		return media.VideoCheckResult{Path: path, Status: media.VideoStatusLikelyOK, Reason: "sampled"}, nil
 	}
 
-	flags := checkVideoFlags{Options: media.DefaultVideoCheckOptions(), Concurrency: 1, Progress: progressOff, RetryTimeouts: true}
+	flags := checkVideoFlags{Options: media.DefaultVideoCheckOptions(), Concurrency: 1, Progress: batch.ProgressOff, RetryTimeouts: true}
 	var out bytes.Buffer
 	if err := runVideoChecksWithChecker(context.Background(), &out, flags, []string{"a.mp4"}, checker); err != nil {
 		t.Fatal(err)
@@ -120,7 +102,7 @@ func TestRunVideoChecksSuppressesSuccessAndPrintsWarningsByDefault(t *testing.T)
 		return media.VideoCheckResult{Path: path, Status: media.VideoStatusLikelyOK, Reason: "sampled"}, nil
 	}
 
-	flags := checkVideoFlags{Options: media.DefaultVideoCheckOptions(), Concurrency: 2, Progress: progressOff}
+	flags := checkVideoFlags{Options: media.DefaultVideoCheckOptions(), Concurrency: 2, Progress: batch.ProgressOff}
 	var out bytes.Buffer
 	if err := runVideoChecksWithChecker(context.Background(), &out, flags, []string{"ok.mp4", "warning.mp4"}, checker); err != nil {
 		t.Fatal(err)

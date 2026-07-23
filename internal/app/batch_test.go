@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrerfcsantos/subkit-codex/internal/batch"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 )
 
@@ -151,7 +152,7 @@ func TestRunBatchHonorsDefaultAndCustomConcurrency(t *testing.T) {
 		concurrency int
 		wantMax     int64
 	}{
-		{name: "default", concurrency: 0, wantMax: defaultConcurrency},
+		{name: "default", concurrency: 0, wantMax: batch.DefaultConcurrency},
 		{name: "custom", concurrency: 2, wantMax: 2},
 	}
 
@@ -179,7 +180,7 @@ func TestRunBatchHonorsDefaultAndCustomConcurrency(t *testing.T) {
 			var out bytes.Buffer
 			err := runBatchWithProcessor(context.Background(), &out, pipeline.DefaultOptions(), batchFlags{
 				Concurrency: tt.concurrency,
-				Progress:    progressOff,
+				Progress:    batch.ProgressOff,
 			}, jobs, process)
 			if err != nil {
 				t.Fatal(err)
@@ -205,7 +206,7 @@ func TestRunBatchAggregatesFailuresAndContinues(t *testing.T) {
 	var out bytes.Buffer
 	err := runBatchWithProcessor(context.Background(), &out, pipeline.DefaultOptions(), batchFlags{
 		Concurrency: 2,
-		Progress:    progressOff,
+		Progress:    batch.ProgressOff,
 	}, jobs, process)
 	if err == nil {
 		t.Fatal("expected batch error")
@@ -219,17 +220,6 @@ func TestRunBatchAggregatesFailuresAndContinues(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "errors:") || !strings.Contains(out.String(), "bad.mp4: decode failed") {
 		t.Fatalf("missing failure summary: %q", out.String())
-	}
-}
-
-func TestPlainReporterPrefixesBatchEvents(t *testing.T) {
-	var out bytes.Buffer
-	reporter := &plainBatchReporter{out: &out, prefix: true}
-	reporter.Report(batchEvent{Input: filepath.Join("media", "movie.mp4"), Stage: pipeline.StageAudio, Message: "extracting"})
-
-	got := out.String()
-	if !strings.Contains(got, "[movie.mp4] audio: extracting") {
-		t.Fatalf("plain output = %q", got)
 	}
 }
 

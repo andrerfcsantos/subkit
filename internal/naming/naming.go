@@ -31,3 +31,14 @@ func InDir(mediaPath string, dir string, suffix string, ext string) string {
 	}
 	return filepath.Join(dir, base+"."+ext)
 }
+
+// PathKey normalizes a path for identity comparisons on case-insensitive
+// filesystems.
+func PathKey(path string) string {
+	return strings.ToLower(filepath.Clean(path))
+}
+
+// HasGlobMeta reports whether value contains glob metacharacters.
+func HasGlobMeta(value string) bool {
+	return strings.ContainsAny(value, "*?[")
+}

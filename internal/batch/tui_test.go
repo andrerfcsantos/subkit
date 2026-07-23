@@ -1,4 +1,4 @@
-package app
+package batch
 
 import (
 	"context"
@@ -22,8 +22,8 @@ func applyUpdate(t *testing.T, model progressModel, msg tea.Msg) progressModel {
 }
 
 func TestProgressModelUpdatesRowFromRunningEvent(t *testing.T) {
-	model := newProgressModel([]batchJob{{Input: "movie.mp4"}}, 4, nil)
-	model = applyUpdate(t, model, progressEventMsg(batchEvent{
+	model := newProgressModel([]string{"movie.mp4"}, 4, nil)
+	model = applyUpdate(t, model, progressEventMsg(Event{
 		Input:   "movie.mp4",
 		Stage:   pipeline.StageTranscribe,
 		Message: "calling Deepgram",
@@ -50,12 +50,12 @@ func TestProgressModelUpdatesRowFromRunningEvent(t *testing.T) {
 }
 
 func TestProgressModelClassifiesDoneVsCached(t *testing.T) {
-	model := newProgressModel([]batchJob{{Input: "a.mp4"}, {Input: "b.mp4"}}, 4, nil)
+	model := newProgressModel([]string{"a.mp4", "b.mp4"}, 4, nil)
 
-	model = applyUpdate(t, model, progressEventMsg(batchEvent{
+	model = applyUpdate(t, model, progressEventMsg(Event{
 		Input: "a.mp4", Stage: pipeline.StageDone, Message: "done", Detail: "wrote a.srt", Cached: false,
 	}))
-	model = applyUpdate(t, model, progressEventMsg(batchEvent{
+	model = applyUpdate(t, model, progressEventMsg(Event{
 		Input: "b.mp4", Stage: pipeline.StageDone, Message: "done", Detail: "cached", Cached: true,
 	}))
 
@@ -79,15 +79,15 @@ func TestProgressModelClassifiesDoneVsCached(t *testing.T) {
 }
 
 func TestProgressModelPinsRunningAndFailedWhilePaging(t *testing.T) {
-	jobs := []batchJob{{Input: "run.mp4"}, {Input: "fail.mp4"}}
+	inputs := []string{"run.mp4", "fail.mp4"}
 	for i := 0; i < 8; i++ {
-		jobs = append(jobs, batchJob{Input: queuedName(i)})
+		inputs = append(inputs, queuedName(i))
 	}
-	model := newProgressModel(jobs, 4, nil)
+	model := newProgressModel(inputs, 4, nil)
 	model = applyUpdate(t, model, tea.WindowSizeMsg{Width: 80, Height: 14})
 
-	model = applyUpdate(t, model, progressEventMsg(batchEvent{Input: "run.mp4", Stage: pipeline.StageTranscribe, Message: "transcribing"}))
-	model = applyUpdate(t, model, progressEventMsg(batchEvent{Input: "fail.mp4", Stage: pipeline.StageFailed, Message: "deepgram: 401"}))
+	model = applyUpdate(t, model, progressEventMsg(Event{Input: "run.mp4", Stage: pipeline.StageTranscribe, Message: "transcribing"}))
+	model = applyUpdate(t, model, progressEventMsg(Event{Input: "fail.mp4", Stage: pipeline.StageFailed, Message: "deepgram: 401"}))
 
 	if model.paginator.TotalPages < 2 {
 		t.Fatalf("expected multiple pages, got %d (perPage=%d)", model.paginator.TotalPages, model.paginator.PerPage)
@@ -121,7 +121,7 @@ func TestProgressModelPinsRunningAndFailedWhilePaging(t *testing.T) {
 
 func TestProgressModelCancelKeyCancelsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	model := newProgressModel([]batchJob{{Input: "movie.mp4"}}, 4, cancel)
+	model := newProgressModel([]string{"movie.mp4"}, 4, cancel)
 
 	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Text: "q", Code: 'q'}))
 	select {
@@ -141,6 +141,17 @@ func TestTruncateDisplayClipsToWidth(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Fatalf("expected ellipsis, got %q", got)
+	}
+}
+
+func TestPlainReporterPrefixesEvents(t *testing.T) {
+	var out strings.Builder
+	reporter := &plainReporter{out: &out, prefix: true}
+	reporter.Report(Event{Input: "media/movie.mp4", Stage: pipeline.StageAudio, Message: "extracting"})
+
+	got := out.String()
+	if !strings.Contains(got, "[movie.mp4] audio: extracting") {
+		t.Fatalf("plain output = %q", got)
 	}
 }
 

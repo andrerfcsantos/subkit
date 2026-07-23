@@ -11,6 +11,7 @@ import (
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 	"github.com/andrerfcsantos/subkit-codex/internal/providers/deepgram"
 	"github.com/andrerfcsantos/subkit-codex/internal/subtitle"
+	"github.com/andrerfcsantos/subkit-codex/internal/videocheck"
 	"github.com/spf13/cobra"
 )
 
@@ -194,7 +195,7 @@ func NewRootCommand() *cobra.Command {
 
 	root.AddCommand(versionCommand())
 	root.AddCommand(cacheCommand(&opts))
-	root.AddCommand(newCheckVideoErrorsCommand())
+	root.AddCommand(videocheck.Command())
 	return root
 }
 

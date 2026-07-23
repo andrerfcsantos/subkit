@@ -7,20 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
+	"github.com/andrerfcsantos/subkit-codex/internal/batch"
 	"github.com/andrerfcsantos/subkit-codex/internal/cache"
 	"github.com/andrerfcsantos/subkit-codex/internal/naming"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 	"github.com/spf13/cobra"
-)
-
-const (
-	defaultConcurrency = 4
-	progressAuto       = "auto"
-	progressTUI        = "tui"
-	progressPlain      = "plain"
-	progressOff        = "off"
 )
 
 type batchFlags struct {
@@ -72,21 +64,6 @@ func (e batchError) Error() string {
 
 type batchProcessor func(context.Context, batchJob, pipeline.Options, pipeline.Reporter) ([]outputResult, error)
 
-type batchEvent struct {
-	Input   string
-	Stage   pipeline.Stage
-	Message string
-	Err     error
-
-	// Detail and Cached are only populated on the terminal StageDone event and
-	// are consumed exclusively by the TUI reporter. Detail is a human summary of
-	// the outcome (e.g. "wrote clip.srt", "wrote 2 files", "cached"); Cached is
-	// true when nothing new was written for the file (every output was already
-	// up to date). Message is left untouched so the plain reporter is unaffected.
-	Detail string
-	Cached bool
-}
-
 // summarizeOutputs derives a short outcome description and whether the file was
 // effectively skipped (all outputs already cached) from the results a worker
 // produced. This is the structural signal for "processed vs cached", replacing
@@ -121,14 +98,9 @@ func summarizeOutputs(outputs []outputResult) (detail string, cached bool) {
 	}
 }
 
-type batchReporter interface {
-	Report(batchEvent)
-	Close()
-}
-
 func addBatchFlags(cmd *cobra.Command, flags *batchFlags) {
-	cmd.Flags().IntVarP(&flags.Concurrency, "concurrency", "j", defaultConcurrency, "maximum number of files to process at once")
-	cmd.Flags().StringVar(&flags.Progress, "progress", progressAuto, "progress display: auto, tui, plain, or off")
+	cmd.Flags().IntVarP(&flags.Concurrency, "concurrency", "j", batch.DefaultConcurrency, "maximum number of files to process at once")
+	cmd.Flags().StringVar(&flags.Progress, "progress", batch.ProgressAuto, "progress display: auto, tui, plain, or off")
 	cmd.Flags().StringVar(&flags.OutputTemplate, "output-template", "", "output path template with tokens like {dir}, {base}, {kind}, and {format}")
 	cmd.Flags().BoolVar(&flags.FailFast, "fail-fast", false, "cancel remaining batch work after the first file failure")
 }
@@ -138,7 +110,7 @@ func resolveInputs(args []string) ([]string, error) {
 	seen := map[string]bool{}
 	for _, arg := range args {
 		matches := []string{arg}
-		if hasGlobMeta(arg) {
+		if naming.HasGlobMeta(arg) {
 			var err error
 			matches, err = filepath.Glob(arg)
 			if err != nil {
@@ -162,7 +134,7 @@ func resolveInputs(args []string) ([]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("resolving %q: %w", match, err)
 			}
-			key := pathKey(abs)
+			key := naming.PathKey(abs)
 			if seen[key] {
 				continue
 			}
@@ -238,23 +210,24 @@ func runBatchWithProcessor(ctx context.Context, out io.Writer, opts pipeline.Opt
 		out = io.Discard
 	}
 	if flags.Concurrency == 0 {
-		flags.Concurrency = defaultConcurrency
+		flags.Concurrency = batch.DefaultConcurrency
 	}
 	if flags.Concurrency < 1 {
 		return fmt.Errorf("--concurrency must be at least 1")
 	}
-	flags.Progress = strings.ToLower(strings.TrimSpace(flags.Progress))
-	if flags.Progress == "" {
-		flags.Progress = progressAuto
-	}
-	if flags.Progress != progressAuto && flags.Progress != progressTUI && flags.Progress != progressPlain && flags.Progress != progressOff {
+	flags.Progress = batch.NormalizeProgressMode(flags.Progress)
+	if !batch.ValidProgressMode(flags.Progress) {
 		return fmt.Errorf("--progress must be one of auto, tui, plain, or off")
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	reporter := newBatchReporter(out, flags.Progress, jobs, flags.Concurrency, cancel)
+	inputs := make([]string, len(jobs))
+	for i, job := range jobs {
+		inputs[i] = job.Input
+	}
+	reporter := batch.NewReporter(out, flags.Progress, inputs, flags.Concurrency, cancel)
 	reporterClosed := false
 	closeReporter := func() {
 		if reporterClosed {
@@ -265,77 +238,37 @@ func runBatchWithProcessor(ctx context.Context, out io.Writer, opts pipeline.Opt
 	}
 	defer closeReporter()
 	for _, job := range jobs {
-		reporter.Report(batchEvent{Input: job.Input, Stage: pipeline.StageQueued, Message: "queued"})
+		reporter.Report(batch.Event{Input: job.Input, Stage: pipeline.StageQueued, Message: "queued"})
 	}
 
-	workerCount := flags.Concurrency
-	if workerCount > len(jobs) {
-		workerCount = len(jobs)
-	}
-	if workerCount == 0 {
-		return nil
-	}
-
-	jobCh := make(chan batchJob)
-	resultCh := make(chan fileResult, len(jobs))
-	var wg sync.WaitGroup
-
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobCh {
-				if ctx.Err() != nil {
-					continue
-				}
-				jobReporter := pipeline.ReporterFunc(func(event pipeline.Event) {
-					reporter.Report(batchEvent{Input: job.Input, Stage: event.Stage, Message: event.Message})
-				})
-				outputs, err := process(ctx, job, opts, jobReporter)
-				if err != nil {
-					reporter.Report(batchEvent{Input: job.Input, Stage: pipeline.StageFailed, Message: err.Error(), Err: err})
-					resultCh <- fileResult{Input: job.Input, Err: err}
-					if flags.FailFast {
-						cancel()
-					}
-					continue
-				}
-				detail, cached := summarizeOutputs(outputs)
-				reporter.Report(batchEvent{Input: job.Input, Stage: pipeline.StageDone, Message: "done", Detail: detail, Cached: cached})
-				resultCh <- fileResult{Input: job.Input, Outputs: outputs}
+	results, completed := batch.Run(ctx, jobs, flags.Concurrency, func(ctx context.Context, job batchJob) fileResult {
+		jobReporter := pipeline.ReporterFunc(func(event pipeline.Event) {
+			reporter.Report(batch.Event{Input: job.Input, Stage: event.Stage, Message: event.Message})
+		})
+		outputs, err := process(ctx, job, opts, jobReporter)
+		if err != nil {
+			reporter.Report(batch.Event{Input: job.Input, Stage: pipeline.StageFailed, Message: err.Error(), Err: err})
+			if flags.FailFast {
+				cancel()
 			}
-		}()
-	}
-
-	go func() {
-		defer close(jobCh)
-		for _, job := range jobs {
-			select {
-			case <-ctx.Done():
-				return
-			case jobCh <- job:
-			}
+			return fileResult{Input: job.Input, Err: err}
 		}
-	}()
+		detail, cached := summarizeOutputs(outputs)
+		reporter.Report(batch.Event{Input: job.Input, Stage: pipeline.StageDone, Message: "done", Detail: detail, Cached: cached})
+		return fileResult{Input: job.Input, Outputs: outputs}
+	})
 
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
+	closeReporter()
 
 	var failures []fileFailure
-	var successes []fileResult
-	for result := range resultCh {
+	for i, result := range results {
+		if !completed[i] {
+			continue
+		}
 		if result.Err != nil {
 			failures = append(failures, fileFailure{Input: result.Input, Err: result.Err})
 			continue
 		}
-		successes = append(successes, result)
-	}
-
-	closeReporter()
-
-	for _, result := range successes {
 		for _, output := range result.Outputs {
 			printOutputResult(out, result.Input, len(jobs) > 1, output)
 		}
@@ -345,10 +278,7 @@ func runBatchWithProcessor(ctx context.Context, out io.Writer, opts pipeline.Opt
 		printFailureSummary(out, failures)
 		return batchError{Failures: failures}
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return nil
+	return ctx.Err()
 }
 
 func processBatchJob(ctx context.Context, job batchJob, opts pipeline.Options, reporter pipeline.Reporter) ([]outputResult, error) {
@@ -426,54 +356,6 @@ func copyArtifactOutput(cachePath string, outputPath string, reporter pipeline.R
 	return outputResult{Path: outputPath, Copied: copied, ForceWrote: explicitOutput}, nil
 }
 
-func newBatchReporter(out io.Writer, mode string, jobs []batchJob, concurrency int, cancel context.CancelFunc) batchReporter {
-	useTUI := false
-	switch mode {
-	case progressTUI:
-		useTUI = true
-	case progressAuto:
-		useTUI = len(jobs) > 1 && isTerminal(out)
-	}
-	if useTUI {
-		return newTUIBatchReporter(out, jobs, concurrency, cancel)
-	}
-	if mode == progressOff {
-		return noopBatchReporter{}
-	}
-	return &plainBatchReporter{out: out, prefix: len(jobs) > 1}
-}
-
-type noopBatchReporter struct{}
-
-func (noopBatchReporter) Report(batchEvent) {}
-func (noopBatchReporter) Close()            {}
-
-type plainBatchReporter struct {
-	out    io.Writer
-	prefix bool
-	mu     sync.Mutex
-}
-
-func (r *plainBatchReporter) Report(event batchEvent) {
-	if event.Message == "" || event.Stage == pipeline.StageWrite {
-		return
-	}
-	if !r.prefix && event.Stage == pipeline.StageQueued {
-		return
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.prefix {
-		fmt.Fprintf(r.out, "[%s] %s: %s\n", filepath.Base(event.Input), event.Stage, event.Message)
-		return
-	}
-	fmt.Fprintf(r.out, "%s: %s\n", event.Stage, event.Message)
-}
-
-func (r *plainBatchReporter) Close() {}
-
 func printOutputResult(out io.Writer, input string, prefix bool, result outputResult) {
 	line := result.Path
 	if !result.ArtifactOnly {
@@ -544,7 +426,7 @@ func preflightOutputCollisions(jobs []batchJob) error {
 			if err != nil {
 				return fmt.Errorf("resolving output %q: %w", output.Path, err)
 			}
-			key := pathKey(abs)
+			key := naming.PathKey(abs)
 			label := fmt.Sprintf("%s -> %s", job.Input, output.Path)
 			if previous, ok := seen[key]; ok {
 				return fmt.Errorf("output path collision: %s conflicts with %s", label, previous)
@@ -564,21 +446,4 @@ func normalizeOutputKind(kind string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(kind))
 	}
-}
-
-func hasGlobMeta(value string) bool {
-	return strings.ContainsAny(value, "*?[")
-}
-
-func pathKey(path string) string {
-	return strings.ToLower(filepath.Clean(path))
-}
-
-func isTerminal(out io.Writer) bool {
-	file, ok := out.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }

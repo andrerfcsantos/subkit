@@ -1,4 +1,7 @@
-package app
+// Package videocheck implements the check-video-errors command: scanning
+// video files for decode errors with ffmpeg/ffprobe, concurrently and with
+// progress reporting, and summarizing the results as text, JSON, or CSV.
+package videocheck
 
 import (
 	"context"
@@ -14,10 +17,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/andrerfcsantos/subkit-codex/internal/batch"
 	"github.com/andrerfcsantos/subkit-codex/internal/media"
+	"github.com/andrerfcsantos/subkit-codex/internal/naming"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 	"github.com/spf13/cobra"
 )
@@ -40,8 +44,7 @@ type checkVideoFlags struct {
 	AnalyzeSeconds float64
 }
 
-type indexedVideoResult struct {
-	index  int
+type videoOutcome struct {
 	result media.VideoCheckResult
 	err    error
 }
@@ -68,14 +71,15 @@ func (e videoCheckBatchError) Error() string {
 	return strings.Join(parts, "; ")
 }
 
-func newCheckVideoErrorsCommand() *cobra.Command {
+// Command builds the hidden check-video-errors cobra command.
+func Command() *cobra.Command {
 	defaults := media.DefaultVideoCheckOptions()
 	flags := checkVideoFlags{
 		Options:        defaults,
 		Mode:           string(defaults.Mode),
 		Extensions:     defaultVideoExtensions,
-		Concurrency:    defaultConcurrency,
-		Progress:       progressAuto,
+		Concurrency:    batch.DefaultConcurrency,
+		Progress:       batch.ProgressAuto,
 		RetryTimeouts:  true,
 		Timeout:        defaults.Timeout.Seconds(),
 		FullTimeout:    defaults.FullTimeout.Seconds(),
@@ -140,8 +144,8 @@ func prepareCheckVideoFlags(flags *checkVideoFlags) error {
 	if flags.Concurrency < 1 {
 		return fmt.Errorf("--concurrency must be at least 1")
 	}
-	flags.Progress = strings.ToLower(strings.TrimSpace(flags.Progress))
-	if flags.Progress != progressAuto && flags.Progress != progressTUI && flags.Progress != progressPlain && flags.Progress != progressOff {
+	flags.Progress = batch.NormalizeProgressMode(flags.Progress)
+	if !batch.ValidProgressMode(flags.Progress) {
 		return fmt.Errorf("--progress must be one of auto, tui, plain, or off")
 	}
 	if flags.Timeout <= 0 || flags.FullTimeout <= 0 || flags.AnalyzeSeconds <= 0 {
@@ -192,7 +196,7 @@ func resolveVideoCheckInputs(args []string, extensions map[string]bool) ([]strin
 		if err != nil {
 			return err
 		}
-		key := pathKey(absolute)
+		key := naming.PathKey(absolute)
 		if !seen[key] {
 			seen[key] = true
 			inputs = append(inputs, absolute)
@@ -220,7 +224,7 @@ func resolveVideoCheckInputs(args []string, extensions map[string]bool) ([]strin
 			if err := addFile(arg); err != nil {
 				return nil, fmt.Errorf("input %q: %w", arg, err)
 			}
-		case hasGlobMeta(arg):
+		case naming.HasGlobMeta(arg):
 			matches, err := expandVideoGlob(arg)
 			if err != nil {
 				return nil, fmt.Errorf("glob %q: %w", arg, err)
@@ -362,71 +366,42 @@ func runVideoChecks(ctx context.Context, out io.Writer, flags checkVideoFlags, i
 }
 
 func runVideoChecksWithChecker(ctx context.Context, out io.Writer, flags checkVideoFlags, inputs []string, check videoChecker) error {
-	jobs := make([]batchJob, len(inputs))
-	for i, input := range inputs {
-		jobs[i] = batchJob{Input: input}
-	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	reporter := newBatchReporter(out, flags.Progress, jobs, flags.Concurrency, cancel)
-	for _, job := range jobs {
-		reporter.Report(batchEvent{Input: job.Input, Stage: pipeline.StageQueued, Message: "queued"})
+	reporter := batch.NewReporter(out, flags.Progress, inputs, flags.Concurrency, cancel)
+	for _, input := range inputs {
+		reporter.Report(batch.Event{Input: input, Stage: pipeline.StageQueued, Message: "queued"})
 	}
 
-	workerCount := min(flags.Concurrency, len(inputs))
-	type indexedInput struct {
-		index int
-		path  string
-	}
-	jobCh := make(chan indexedInput)
-	resultCh := make(chan indexedVideoResult, len(inputs))
-	var workers sync.WaitGroup
-	for range workerCount {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for job := range jobCh {
-				if ctx.Err() != nil {
-					return
-				}
-				result, err := check(ctx, job.path, flags.Options, func(event media.VideoCheckEvent) {
-					reporter.Report(batchEvent{Input: job.path, Stage: pipeline.Stage(event.Stage), Message: event.Message})
-				})
-				if err != nil {
-					reporter.Report(batchEvent{Input: job.path, Stage: pipeline.StageFailed, Message: err.Error(), Err: err})
-				} else if result.Valid() {
-					reporter.Report(batchEvent{Input: job.path, Stage: pipeline.StageDone, Message: "done", Detail: strings.ToLower(string(result.Status))})
-				} else {
-					detail := videoResultSummary(result)
-					reporter.Report(batchEvent{Input: job.path, Stage: pipeline.StageFailed, Message: detail, Err: fmt.Errorf("%s", detail)})
-				}
-				resultCh <- indexedVideoResult{index: job.index, result: result, err: err}
-			}
-		}()
-	}
-	go func() {
-		defer close(jobCh)
-		for i, input := range inputs {
-			select {
-			case <-ctx.Done():
-				return
-			case jobCh <- indexedInput{index: i, path: input}:
-			}
+	reportOutcome := func(input string, message string, result media.VideoCheckResult, err error) {
+		switch {
+		case err != nil:
+			reporter.Report(batch.Event{Input: input, Stage: pipeline.StageFailed, Message: err.Error(), Err: err})
+		case result.Valid():
+			reporter.Report(batch.Event{Input: input, Stage: pipeline.StageDone, Message: message, Detail: strings.ToLower(string(result.Status))})
+		default:
+			detail := videoResultSummary(result)
+			reporter.Report(batch.Event{Input: input, Stage: pipeline.StageFailed, Message: detail, Err: fmt.Errorf("%s", detail)})
 		}
-	}()
-	go func() {
-		workers.Wait()
-		close(resultCh)
-	}()
+	}
+
+	outcomes, completed := batch.Run(ctx, inputs, flags.Concurrency, func(ctx context.Context, input string) videoOutcome {
+		result, err := check(ctx, input, flags.Options, func(event media.VideoCheckEvent) {
+			reporter.Report(batch.Event{Input: input, Stage: pipeline.Stage(event.Stage), Message: event.Message})
+		})
+		reportOutcome(input, "done", result, err)
+		return videoOutcome{result: result, err: err}
+	})
 
 	results := make([]media.VideoCheckResult, len(inputs))
-	completed := make([]bool, len(inputs))
-	for item := range resultCh {
-		results[item.index] = item.result
-		if item.err != nil && results[item.index].Path == "" {
-			results[item.index] = media.VideoCheckResult{Path: inputs[item.index], Status: media.VideoStatusInconclusive, Reason: item.err.Error()}
+	for i, outcome := range outcomes {
+		if !completed[i] {
+			continue
 		}
-		completed[item.index] = true
+		results[i] = outcome.result
+		if outcome.err != nil && results[i].Path == "" {
+			results[i] = media.VideoCheckResult{Path: inputs[i], Status: media.VideoStatusInconclusive, Reason: outcome.err.Error()}
+		}
 	}
 	if flags.RetryTimeouts {
 		for i, result := range results {
@@ -434,21 +409,14 @@ func runVideoChecksWithChecker(ctx context.Context, out io.Writer, flags checkVi
 				continue
 			}
 			input := inputs[i]
-			reporter.Report(batchEvent{Input: input, Stage: pipeline.Stage("retry"), Message: "retrying timed-out video with no competing decoder"})
+			reporter.Report(batch.Event{Input: input, Stage: pipeline.Stage("retry"), Message: "retrying timed-out video with no competing decoder"})
 			retried, err := check(ctx, input, flags.Options, func(event media.VideoCheckEvent) {
-				reporter.Report(batchEvent{Input: input, Stage: pipeline.Stage(event.Stage), Message: event.Message})
+				reporter.Report(batch.Event{Input: input, Stage: pipeline.Stage(event.Stage), Message: event.Message})
 			})
-			if err != nil {
-				if retried.Path == "" {
-					retried = media.VideoCheckResult{Path: input, Status: media.VideoStatusInconclusive, Reason: err.Error()}
-				}
-				reporter.Report(batchEvent{Input: input, Stage: pipeline.StageFailed, Message: err.Error(), Err: err})
-			} else if retried.Valid() {
-				reporter.Report(batchEvent{Input: input, Stage: pipeline.StageDone, Message: "retry done", Detail: strings.ToLower(string(retried.Status))})
-			} else {
-				detail := videoResultSummary(retried)
-				reporter.Report(batchEvent{Input: input, Stage: pipeline.StageFailed, Message: detail, Err: fmt.Errorf("%s", detail)})
+			if err != nil && retried.Path == "" {
+				retried = media.VideoCheckResult{Path: input, Status: media.VideoStatusInconclusive, Reason: err.Error()}
 			}
+			reportOutcome(input, "retry done", retried, err)
 			results[i] = retried
 		}
 	}

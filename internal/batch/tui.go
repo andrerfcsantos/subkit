@@ -1,4 +1,4 @@
-package app
+package batch
 
 import (
 	"context"
@@ -18,15 +18,15 @@ import (
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 )
 
-type tuiBatchReporter struct {
+type tuiReporter struct {
 	program *tea.Program
 	done    chan struct{}
 }
 
-func newTUIBatchReporter(out io.Writer, jobs []batchJob, concurrency int, cancel context.CancelFunc) batchReporter {
-	model := newProgressModel(jobs, concurrency, cancel)
+func newTUIReporter(out io.Writer, inputs []string, concurrency int, cancel context.CancelFunc) Reporter {
+	model := newProgressModel(inputs, concurrency, cancel)
 	program := tea.NewProgram(model, tea.WithOutput(out), tea.WithInput(os.Stdin))
-	reporter := &tuiBatchReporter{program: program, done: make(chan struct{})}
+	reporter := &tuiReporter{program: program, done: make(chan struct{})}
 	go func() {
 		_, _ = program.Run()
 		close(reporter.done)
@@ -34,11 +34,11 @@ func newTUIBatchReporter(out io.Writer, jobs []batchJob, concurrency int, cancel
 	return reporter
 }
 
-func (r *tuiBatchReporter) Report(event batchEvent) {
+func (r *tuiReporter) Report(event Event) {
 	r.program.Send(progressEventMsg(event))
 }
 
-func (r *tuiBatchReporter) Close() {
+func (r *tuiReporter) Close() {
 	select {
 	case <-r.done:
 		return
@@ -48,7 +48,7 @@ func (r *tuiBatchReporter) Close() {
 	<-r.done
 }
 
-type progressEventMsg batchEvent
+type progressEventMsg Event
 type progressDoneMsg struct{}
 
 type jobState int
@@ -119,12 +119,12 @@ var (
 	progressFailedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 )
 
-func newProgressModel(jobs []batchJob, concurrency int, cancel context.CancelFunc) progressModel {
-	rows := make([]progressRow, 0, len(jobs))
+func newProgressModel(inputs []string, concurrency int, cancel context.CancelFunc) progressModel {
+	rows := make([]progressRow, 0, len(inputs))
 	index := map[string]int{}
-	for _, job := range jobs {
-		index[job.Input] = len(rows)
-		rows = append(rows, progressRow{Input: job.Input, State: stateQueued, Detail: "queued"})
+	for _, input := range inputs {
+		index[input] = len(rows)
+		rows = append(rows, progressRow{Input: input, State: stateQueued, Detail: "queued"})
 	}
 
 	if concurrency < 1 {
@@ -183,7 +183,7 @@ func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.paginator, cmd = m.paginator.Update(msg)
 		return m, cmd
 	case progressEventMsg:
-		m.applyEvent(batchEvent(msg))
+		m.applyEvent(Event(msg))
 		m.applyLayout()
 		return m, nil
 	case spinner.TickMsg:
@@ -197,7 +197,7 @@ func (m progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *progressModel) applyEvent(event batchEvent) {
+func (m *progressModel) applyEvent(event Event) {
 	idx, ok := m.index[event.Input]
 	if !ok {
 		return
