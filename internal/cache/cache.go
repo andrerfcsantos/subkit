@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/andrerfcsantos/subkit-codex/internal/flagutil"
 )
 
 // pathLocks serializes work on a cache path across every store in the
@@ -61,13 +63,8 @@ func NewStore(root string, read bool, write bool, refresh bool, rerun []string) 
 			return nil, err
 		}
 	}
-	for _, item := range rerun {
-		for _, part := range strings.Split(item, ",") {
-			part = strings.TrimSpace(strings.ToLower(part))
-			if part != "" {
-				store.Rerun[part] = true
-			}
-		}
+	for _, part := range flagutil.SplitCSV(rerun) {
+		store.Rerun[strings.ToLower(part)] = true
 	}
 
 	if write {

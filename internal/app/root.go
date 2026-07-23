@@ -3,10 +3,10 @@ package app
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/andrerfcsantos/subkit-codex/internal/cache"
+	"github.com/andrerfcsantos/subkit-codex/internal/flagutil"
 	"github.com/andrerfcsantos/subkit-codex/internal/media"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 	"github.com/andrerfcsantos/subkit-codex/internal/providers/deepgram"
@@ -48,7 +48,7 @@ func NewRootCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			selectedFormats := splitValues(formats)
+			selectedFormats := flagutil.SplitCSV(formats)
 			if len(selectedFormats) == 0 {
 				selectedFormats = []string{"srt"}
 			}
@@ -297,7 +297,7 @@ func addCueFlags(cmd *cobra.Command, opts *subtitle.CueOptions) {
 
 func parseOutputSpecs(values []string) ([]outputSpec, error) {
 	var specs []outputSpec
-	for _, value := range splitValues(values) {
+	for _, value := range flagutil.SplitCSV(values) {
 		kind, format, ok := strings.Cut(value, ":")
 		if !ok {
 			return nil, fmt.Errorf("output %q should look like kind:format", value)
@@ -310,35 +310,6 @@ func parseOutputSpecs(values []string) ([]outputSpec, error) {
 		specs = append(specs, outputSpec{Kind: kind, Format: format})
 	}
 	return specs, nil
-}
-
-func splitValues(values []string) []string {
-	var result []string
-	for _, value := range values {
-		for _, part := range strings.Split(value, ",") {
-			part = strings.TrimSpace(part)
-			if part != "" {
-				result = append(result, part)
-			}
-		}
-	}
-	return result
-}
-
-func outputInDir(mediaPath string, outputDir string, ext string) string {
-	if outputDir == "" {
-		return ""
-	}
-	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
-	return filepath.Join(outputDir, base+"."+ext)
-}
-
-func namedOutputInDir(mediaPath string, outputDir string, suffix string, ext string) string {
-	if outputDir == "" {
-		return ""
-	}
-	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
-	return filepath.Join(outputDir, base+"."+suffix+"."+ext)
 }
 
 func humanBytes(size int64) string {

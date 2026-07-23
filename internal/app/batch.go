@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/andrerfcsantos/subkit-codex/internal/cache"
+	"github.com/andrerfcsantos/subkit-codex/internal/naming"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
 	"github.com/spf13/cobra"
 )
@@ -504,20 +505,16 @@ func planOutputPath(input string, kind string, format string, outputDir string, 
 	}
 	if outputDir != "" {
 		if kind == "subtitle" {
-			return outputInDir(input, outputDir, format), nil
+			return naming.InDir(input, outputDir, "", format), nil
 		}
-		return namedOutputInDir(input, outputDir, kind, format), nil
+		return naming.InDir(input, outputDir, kind, format), nil
 	}
 
 	switch kind {
 	case "subtitle":
-		return replaceExt(input, format), nil
-	case "script":
-		return namedOutputPath(input, "script", format), nil
-	case "words":
-		return namedOutputPath(input, "words", format), nil
-	case "audio", "transcript", "cues":
-		return "", nil
+		return naming.ReplaceExt(input, format), nil
+	case "script", "words":
+		return naming.Sibling(input, kind, format), nil
 	default:
 		return "", nil
 	}
@@ -567,19 +564,6 @@ func normalizeOutputKind(kind string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(kind))
 	}
-}
-
-func namedOutputPath(mediaPath string, suffix string, ext string) string {
-	dir := filepath.Dir(mediaPath)
-	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
-	return filepath.Join(dir, base+"."+suffix+"."+ext)
-}
-
-func replaceExt(path string, ext string) string {
-	if ext != "" && !strings.HasPrefix(ext, ".") {
-		ext = "." + ext
-	}
-	return strings.TrimSuffix(path, filepath.Ext(path)) + ext
 }
 
 func hasGlobMeta(value string) bool {

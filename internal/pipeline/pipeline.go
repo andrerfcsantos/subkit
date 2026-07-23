@@ -11,6 +11,7 @@ import (
 
 	"github.com/andrerfcsantos/subkit-codex/internal/cache"
 	"github.com/andrerfcsantos/subkit-codex/internal/media"
+	"github.com/andrerfcsantos/subkit-codex/internal/naming"
 	"github.com/andrerfcsantos/subkit-codex/internal/providers/deepgram"
 	"github.com/andrerfcsantos/subkit-codex/internal/subtitle"
 	"github.com/andrerfcsantos/subkit-codex/internal/transcript"
@@ -389,7 +390,7 @@ func (r *Runner) EnsureSubtitle(ctx context.Context, mediaPath string, format st
 	}
 
 	if outputPath == "" {
-		outputPath = defaultOutputPath(mediaPath, format)
+		outputPath = naming.ReplaceExt(mediaPath, format)
 	}
 	copied, err := cache.CopyFileIfDifferent(cachePath, outputPath)
 	if err != nil {
@@ -432,7 +433,7 @@ func (r *Runner) EnsureScript(ctx context.Context, mediaPath string, format stri
 	}
 
 	if outputPath == "" {
-		outputPath = defaultNamedOutputPath(mediaPath, "script", format)
+		outputPath = naming.Sibling(mediaPath, "script", format)
 	}
 	copied, err := cache.CopyFileIfDifferent(cachePath, outputPath)
 	if err != nil {
@@ -468,7 +469,7 @@ func (r *Runner) EnsureWords(ctx context.Context, mediaPath string, outputPath s
 	}
 
 	if outputPath == "" {
-		outputPath = defaultNamedOutputPath(mediaPath, "words", "json")
+		outputPath = naming.Sibling(mediaPath, "words", "json")
 	}
 	copied, err := cache.CopyFileIfDifferent(cachePath, outputPath)
 	if err != nil {
@@ -528,19 +529,3 @@ func (r *Runner) reportWrite(path string, copied bool) {
 	r.report(StageWrite, "cached %s", path)
 }
 
-func defaultOutputPath(mediaPath string, ext string) string {
-	return replaceExt(mediaPath, ext)
-}
-
-func defaultNamedOutputPath(mediaPath string, suffix string, ext string) string {
-	dir := filepath.Dir(mediaPath)
-	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
-	return filepath.Join(dir, base+"."+suffix+"."+ext)
-}
-
-func replaceExt(path string, ext string) string {
-	if ext != "" && !strings.HasPrefix(ext, ".") {
-		ext = "." + ext
-	}
-	return strings.TrimSuffix(path, filepath.Ext(path)) + ext
-}
