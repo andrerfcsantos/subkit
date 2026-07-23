@@ -23,7 +23,7 @@ type Store struct {
 	Write   bool
 	Refresh bool
 	Rerun   map[string]bool
-	TempDir string
+	tempDir string
 }
 
 func NewStore(root string, read bool, write bool, refresh bool, rerun []string) (*Store, error) {
@@ -35,22 +35,19 @@ func NewStore(root string, read bool, write bool, refresh bool, rerun []string) 
 		root = filepath.Join(defaultRoot, "subkit")
 	}
 
-	tempDir := ""
-	if !read || !write {
-		dir, err := os.MkdirTemp("", "subkit-*")
-		if err != nil {
-			return nil, fmt.Errorf("creating temp work dir: %w", err)
-		}
-		tempDir = dir
-	}
-
 	store := &Store{
 		Root:    root,
 		Read:    read,
 		Write:   write,
 		Refresh: refresh,
 		Rerun:   map[string]bool{},
-		TempDir: tempDir,
+	}
+	if !read || !write {
+		// Path falls back to scratch space when the persistent cache is
+		// disabled, so it has to exist up front.
+		if _, err := store.Scratch(); err != nil {
+			return nil, err
+		}
 	}
 	for _, item := range rerun {
 		for _, part := range strings.Split(item, ",") {
@@ -82,10 +79,35 @@ func (s *Store) CanWrite() bool {
 	return s.Write
 }
 
+// Scratch lazily creates and returns the store's temporary work directory. It
+// backs both cache paths when persistence is disabled and run-local artifacts
+// like temporary audio; Close removes it.
+func (s *Store) Scratch() (string, error) {
+	if s.tempDir != "" {
+		return s.tempDir, nil
+	}
+	dir, err := os.MkdirTemp("", "subkit-*")
+	if err != nil {
+		return "", fmt.Errorf("creating temp work dir: %w", err)
+	}
+	s.tempDir = dir
+	return dir, nil
+}
+
+// Close removes the store's scratch directory, if one was created.
+func (s *Store) Close() error {
+	if s.tempDir == "" {
+		return nil
+	}
+	dir := s.tempDir
+	s.tempDir = ""
+	return os.RemoveAll(dir)
+}
+
 func (s *Store) Path(kind string, key string, ext string) string {
 	base := s.Root
-	if !s.Write && !s.Read && s.TempDir != "" {
-		base = s.TempDir
+	if !s.Write && !s.Read && s.tempDir != "" {
+		base = s.tempDir
 	}
 	if ext != "" && !strings.HasPrefix(ext, ".") {
 		ext = "." + ext

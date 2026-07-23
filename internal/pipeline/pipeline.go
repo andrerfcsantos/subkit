@@ -46,7 +46,6 @@ type Runner struct {
 	Store          *cache.Store
 	Opts           Options
 	Reporter       Reporter
-	tempDir        string
 	audioMemo      *memoAudio
 	transcriptMemo *memoTranscript
 	cuesMemo       *memoCues
@@ -97,12 +96,7 @@ func NewRunnerWithReporter(opts Options, reporter Reporter) (*Runner, error) {
 }
 
 func (r *Runner) Close() error {
-	if r.tempDir == "" {
-		return nil
-	}
-	tempDir := r.tempDir
-	r.tempDir = ""
-	return os.RemoveAll(tempDir)
+	return r.Store.Close()
 }
 
 // ensureArtifact runs the cache dance shared by every pipeline step: attempt a
@@ -471,27 +465,15 @@ func (r *Runner) audioArtifactPath(key string, ext string) (string, bool, error)
 	if r.persistAudio() {
 		return r.Store.Path("audio", key, ext), true, nil
 	}
-	tempDir, err := r.ensureTempDir()
+	scratch, err := r.Store.Scratch()
 	if err != nil {
 		return "", false, err
 	}
-	return filepath.Join(tempDir, "audio", artifactFileName(key, ext)), false, nil
+	return filepath.Join(scratch, "audio", artifactFileName(key, ext)), false, nil
 }
 
 func (r *Runner) persistAudio() bool {
 	return r.Opts.Cache.CacheAudio && r.Store.CanWrite()
-}
-
-func (r *Runner) ensureTempDir() (string, error) {
-	if r.tempDir != "" {
-		return r.tempDir, nil
-	}
-	dir, err := os.MkdirTemp("", "subkit-audio-*")
-	if err != nil {
-		return "", fmt.Errorf("creating temporary audio dir: %w", err)
-	}
-	r.tempDir = dir
-	return dir, nil
 }
 
 func artifactFileName(key string, ext string) string {
