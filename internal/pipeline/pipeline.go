@@ -59,21 +59,22 @@ type Artifact struct {
 	FromCache bool
 }
 
+// The memo types short-circuit repeated work within a single runner. They are
+// keyed on the artifact key, which already folds in the source content hash
+// and the step options, so a runner whose options change between calls can
+// never serve a stale artifact.
 type memoAudio struct {
-	MediaPath string
-	Artifact  Artifact
+	Artifact Artifact
 }
 
 type memoTranscript struct {
-	MediaPath string
-	Artifact  Artifact
-	Data      *transcript.Transcript
+	Artifact Artifact
+	Data     *transcript.Transcript
 }
 
 type memoCues struct {
-	MediaPath string
-	Artifact  Artifact
-	Data      subtitle.CueSet
+	Artifact Artifact
+	Data     subtitle.CueSet
 }
 
 type audioIdentity struct {
@@ -174,7 +175,7 @@ func (r *Runner) EnsureAudio(ctx context.Context, mediaPath string) (Artifact, e
 }
 
 func (r *Runner) ensureAudio(ctx context.Context, identity audioIdentity) (Artifact, error) {
-	if r.audioMemo != nil && r.audioMemo.MediaPath == identity.MediaPath && r.audioMemo.Artifact.Key == identity.Key && r.Store.Exists(r.audioMemo.Artifact.Path) {
+	if r.audioMemo != nil && r.audioMemo.Artifact.Key == identity.Key && r.Store.Exists(r.audioMemo.Artifact.Path) {
 		return r.audioMemo.Artifact, nil
 	}
 
@@ -220,18 +221,11 @@ func (r *Runner) ensureAudio(ctx context.Context, identity audioIdentity) (Artif
 		r.report(StageAudio, "cache hit %s", path)
 	}
 	artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path, FromCache: fromCache}
-	r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
+	r.audioMemo = &memoAudio{Artifact: artifact}
 	return artifact, nil
 }
 
 func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifact, *transcript.Transcript, error) {
-	absMediaPath, err := filepath.Abs(mediaPath)
-	if err != nil {
-		return Artifact{}, nil, err
-	}
-	if r.transcriptMemo != nil && r.transcriptMemo.MediaPath == absMediaPath {
-		return r.transcriptMemo.Artifact, r.transcriptMemo.Data, nil
-	}
 	audioIdentity, err := r.audioIdentity(ctx, mediaPath)
 	if err != nil {
 		return Artifact{}, nil, err
@@ -244,6 +238,9 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 	})
 	if err != nil {
 		return Artifact{}, nil, err
+	}
+	if r.transcriptMemo != nil && r.transcriptMemo.Artifact.Key == key {
+		return r.transcriptMemo.Artifact, r.transcriptMemo.Data, nil
 	}
 
 	path := r.Store.Path("transcripts", key, "json")
@@ -299,18 +296,11 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 	}
 
 	artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: fromCache || fromRaw}
-	r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: t}
+	r.transcriptMemo = &memoTranscript{Artifact: artifact, Data: t}
 	return artifact, t, nil
 }
 
 func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, subtitle.CueSet, error) {
-	absMediaPath, err := filepath.Abs(mediaPath)
-	if err != nil {
-		return Artifact{}, subtitle.CueSet{}, err
-	}
-	if r.cuesMemo != nil && r.cuesMemo.MediaPath == absMediaPath {
-		return r.cuesMemo.Artifact, r.cuesMemo.Data, nil
-	}
 	transcriptArtifact, t, err := r.EnsureTranscript(ctx, mediaPath)
 	if err != nil {
 		return Artifact{}, subtitle.CueSet{}, err
@@ -323,6 +313,9 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 	})
 	if err != nil {
 		return Artifact{}, subtitle.CueSet{}, err
+	}
+	if r.cuesMemo != nil && r.cuesMemo.Artifact.Key == key {
+		return r.cuesMemo.Artifact, r.cuesMemo.Data, nil
 	}
 
 	path := r.Store.Path("cues", key, "json")
@@ -343,7 +336,7 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 	}
 
 	artifact := Artifact{Kind: "cues", Key: key, Path: path, FromCache: fromCache}
-	r.cuesMemo = &memoCues{MediaPath: absMediaPath, Artifact: artifact, Data: cues}
+	r.cuesMemo = &memoCues{Artifact: artifact, Data: cues}
 	return artifact, cues, nil
 }
 
