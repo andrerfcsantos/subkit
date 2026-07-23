@@ -30,10 +30,10 @@ subkit cache list
 subkit cache clean
 ```
 
-Run locally with:
+Run locally with your own media file (sample media is not checked into the repository):
 
 ```bash
-go run ./cmd/subkit subtitle ./data/saudemental.mp4 --language pt-PT --model general --format srt --format vtt
+go run ./cmd/subkit subtitle ./your-video.mp4 --language pt-PT --model general --format srt --format vtt
 ```
 
 Batch runs accept explicit files or globs. Inputs are processed concurrently with a default limit of four files at a time:
@@ -125,6 +125,10 @@ provider metadata
 ```
 
 Those fields map reasonably well to common STT providers: Deepgram utterances/paragraphs, AssemblyAI words/utterances, Google/AWS alternatives and word timings, and Whisper-style segments.
+
+## Releases
+
+Releases are cut by pushing a `v*` tag, which runs GoReleaser through GitHub Actions. The release configuration depends on [GoReleaser Pro](https://goreleaser.com/pro/) features (MSI, DMG, and winget packaging), so reproducing a full release locally requires a Pro license and the `GORELEASER_KEY`, `WINGET_GITHUB_TOKEN` secrets. Plain `go build ./cmd/subkit` is enough for local development builds.
 
 ## Notes
 
