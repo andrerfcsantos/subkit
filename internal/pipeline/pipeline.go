@@ -105,6 +105,26 @@ func (r *Runner) Close() error {
 	return os.RemoveAll(tempDir)
 }
 
+// ensureArtifact runs the cache dance shared by every pipeline step: attempt a
+// cached read, then take the per-path lock, re-check under the lock, and
+// finally build the artifact. read is only invoked when canRead is true and
+// path already exists; build must leave the finished artifact at path. The
+// returned bool reports whether the artifact came from a cached read.
+func ensureArtifact[T any](store *cache.Store, canRead bool, path string, read func() (T, error), build func() (T, error)) (T, bool, error) {
+	if canRead && store.Exists(path) {
+		value, err := read()
+		return value, true, err
+	}
+	unlock := store.LockPath(path)
+	defer unlock()
+	if canRead && store.Exists(path) {
+		value, err := read()
+		return value, true, err
+	}
+	value, err := build()
+	return value, false, err
+}
+
 func (r *Runner) audioIdentity(ctx context.Context, mediaPath string) (audioIdentity, error) {
 	absMediaPath, err := filepath.Abs(mediaPath)
 	if err != nil {
@@ -149,50 +169,44 @@ func (r *Runner) ensureAudio(ctx context.Context, identity audioIdentity) (Artif
 	if err != nil {
 		return Artifact{}, err
 	}
-	if persistent && r.Store.CanRead("audio") && r.Store.Exists(path) {
-		r.report(StageAudio, "cache hit %s", path)
-		artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path, FromCache: true}
-		r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
-		return artifact, nil
+	canRead := true
+	if persistent {
+		canRead = r.Store.CanRead("audio")
 	}
 
-	unlock := r.Store.LockPath(path)
-	defer unlock()
-	if persistent && r.Store.CanRead("audio") && r.Store.Exists(path) {
-		r.report(StageAudio, "cache hit %s", path)
-		artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path, FromCache: true}
-		r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
-		return artifact, nil
-	}
-	if !persistent && r.Store.Exists(path) {
-		artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path}
-		r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
-		return artifact, nil
-	}
-
-	r.report(StageAudio, "extracting with ffmpeg")
-	if err := r.Store.EnsureDir(path); err != nil {
-		return Artifact{}, err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	_, fromCache, err := ensureArtifact(r.Store, canRead, path, func() (struct{}, error) {
+		return struct{}{}, nil
+	}, func() (struct{}, error) {
+		r.report(StageAudio, "extracting with ffmpeg")
+		if err := r.Store.EnsureDir(path); err != nil {
+			return struct{}{}, err
+		}
+		temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+		if err != nil {
+			return struct{}{}, err
+		}
+		tempPath := temp.Name()
+		if err := temp.Close(); err != nil {
+			_ = os.Remove(tempPath)
+			return struct{}{}, err
+		}
+		defer func() {
+			_ = os.Remove(tempPath)
+		}()
+		if err := media.ExtractAudio(ctx, identity.MediaPath, tempPath, r.Opts.Audio); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, r.Store.CommitFile(tempPath, path)
+	})
 	if err != nil {
 		return Artifact{}, err
 	}
-	tempPath := temp.Name()
-	if err := temp.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return Artifact{}, err
+
+	fromCache = fromCache && persistent
+	if fromCache {
+		r.report(StageAudio, "cache hit %s", path)
 	}
-	defer func() {
-		_ = os.Remove(tempPath)
-	}()
-	if err := media.ExtractAudio(ctx, identity.MediaPath, tempPath, r.Opts.Audio); err != nil {
-		return Artifact{}, err
-	}
-	if err := r.Store.CommitFile(tempPath, path); err != nil {
-		return Artifact{}, err
-	}
-	artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path}
+	artifact := Artifact{Kind: "audio", Key: identity.Key, Path: path, FromCache: fromCache}
 	r.audioMemo = &memoAudio{MediaPath: identity.MediaPath, Artifact: artifact}
 	return artifact, nil
 }
@@ -220,68 +234,58 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 	}
 
 	path := r.Store.Path("transcripts", key, "json")
-	if r.Store.CanRead("transcribe") && r.Store.Exists(path) {
-		var t transcript.Transcript
-		if err := r.Store.ReadJSON(path, &t); err != nil {
-			return Artifact{}, nil, err
-		}
-		r.report(StageTranscribe, "cache hit %s", path)
-		artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: true}
-		r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: &t}
-		return artifact, &t, nil
-	}
-
-	unlock := r.Store.LockPath(path)
-	defer unlock()
-	if r.Store.CanRead("transcribe") && r.Store.Exists(path) {
-		var t transcript.Transcript
-		if err := r.Store.ReadJSON(path, &t); err != nil {
-			return Artifact{}, nil, err
-		}
-		r.report(StageTranscribe, "cache hit %s", path)
-		artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: true}
-		r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: &t}
-		return artifact, &t, nil
-	}
-
 	rawPath := r.Store.Path("deepgram-raw", key, "json")
-	if r.Store.CanRead("transcribe") && r.Store.Exists(rawPath) {
-		raw, err := os.ReadFile(rawPath)
+	fromRaw := false
+	t, fromCache, err := ensureArtifact(r.Store, r.Store.CanRead("transcribe"), path, func() (*transcript.Transcript, error) {
+		var t transcript.Transcript
+		if err := r.Store.ReadJSON(path, &t); err != nil {
+			return nil, err
+		}
+		r.report(StageTranscribe, "cache hit %s", path)
+		return &t, nil
+	}, func() (*transcript.Transcript, error) {
+		if r.Store.CanRead("transcribe") && r.Store.Exists(rawPath) {
+			raw, err := os.ReadFile(rawPath)
+			if err != nil {
+				return nil, err
+			}
+			var response deepgram.Response
+			if err := json.Unmarshal(raw, &response); err != nil {
+				return nil, err
+			}
+			t := deepgram.Normalize(response, r.Opts.Deepgram)
+			if err := r.Store.WriteJSON(path, t); err != nil {
+				return nil, err
+			}
+			r.report(StageTranscribe, "rebuilt normalized transcript from raw cache")
+			fromRaw = true
+			return &t, nil
+		}
+
+		audioArtifact, err := r.ensureAudio(ctx, audioIdentity)
 		if err != nil {
-			return Artifact{}, nil, err
+			return nil, err
 		}
-		var response deepgram.Response
-		if err := json.Unmarshal(raw, &response); err != nil {
-			return Artifact{}, nil, err
+		r.report(StageTranscribe, "calling Deepgram")
+		client := deepgram.Client{}
+		contentType := media.AudioContentType(r.Opts.Audio.Format)
+		t, raw, err := client.TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
+		if err != nil {
+			return nil, err
 		}
-		t := deepgram.Normalize(response, r.Opts.Deepgram)
+		if err := r.Store.WriteFile(rawPath, raw, 0o644); err != nil {
+			return nil, err
+		}
 		if err := r.Store.WriteJSON(path, t); err != nil {
-			return Artifact{}, nil, err
+			return nil, err
 		}
-		r.report(StageTranscribe, "rebuilt normalized transcript from raw cache")
-		artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: true}
-		r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: &t}
-		return artifact, &t, nil
+		return t, nil
+	})
+	if err != nil {
+		return Artifact{}, nil, err
 	}
 
-	audioArtifact, err := r.ensureAudio(ctx, audioIdentity)
-	if err != nil {
-		return Artifact{}, nil, err
-	}
-	r.report(StageTranscribe, "calling Deepgram")
-	client := deepgram.Client{}
-	contentType := media.AudioContentType(r.Opts.Audio.Format)
-	t, raw, err := client.TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
-	if err != nil {
-		return Artifact{}, nil, err
-	}
-	if err := r.Store.WriteFile(rawPath, raw, 0o644); err != nil {
-		return Artifact{}, nil, err
-	}
-	if err := r.Store.WriteJSON(path, t); err != nil {
-		return Artifact{}, nil, err
-	}
-	artifact := Artifact{Kind: "transcript", Key: key, Path: path}
+	artifact := Artifact{Kind: "transcript", Key: key, Path: path, FromCache: fromCache || fromRaw}
 	r.transcriptMemo = &memoTranscript{MediaPath: absMediaPath, Artifact: artifact, Data: t}
 	return artifact, t, nil
 }
@@ -309,36 +313,23 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 	}
 
 	path := r.Store.Path("cues", key, "json")
-	if r.Store.CanRead("cues") && r.Store.Exists(path) {
+	cues, fromCache, err := ensureArtifact(r.Store, r.Store.CanRead("cues"), path, func() (subtitle.CueSet, error) {
 		var cues subtitle.CueSet
 		if err := r.Store.ReadJSON(path, &cues); err != nil {
-			return Artifact{}, subtitle.CueSet{}, err
+			return subtitle.CueSet{}, err
 		}
 		r.report(StageCues, "cache hit %s", path)
-		artifact := Artifact{Kind: "cues", Key: key, Path: path, FromCache: true}
-		r.cuesMemo = &memoCues{MediaPath: absMediaPath, Artifact: artifact, Data: cues}
-		return artifact, cues, nil
-	}
-
-	unlock := r.Store.LockPath(path)
-	defer unlock()
-	if r.Store.CanRead("cues") && r.Store.Exists(path) {
-		var cues subtitle.CueSet
-		if err := r.Store.ReadJSON(path, &cues); err != nil {
-			return Artifact{}, subtitle.CueSet{}, err
-		}
-		r.report(StageCues, "cache hit %s", path)
-		artifact := Artifact{Kind: "cues", Key: key, Path: path, FromCache: true}
-		r.cuesMemo = &memoCues{MediaPath: absMediaPath, Artifact: artifact, Data: cues}
-		return artifact, cues, nil
-	}
-
-	r.report(StageCues, "building subtitle cues")
-	cues := subtitle.BuildCues(*t, r.Opts.Cues)
-	if err := r.Store.WriteJSON(path, cues); err != nil {
+		return cues, nil
+	}, func() (subtitle.CueSet, error) {
+		r.report(StageCues, "building subtitle cues")
+		cues := subtitle.BuildCues(*t, r.Opts.Cues)
+		return cues, r.Store.WriteJSON(path, cues)
+	})
+	if err != nil {
 		return Artifact{}, subtitle.CueSet{}, err
 	}
-	artifact := Artifact{Kind: "cues", Key: key, Path: path}
+
+	artifact := Artifact{Kind: "cues", Key: key, Path: path, FromCache: fromCache}
 	r.cuesMemo = &memoCues{MediaPath: absMediaPath, Artifact: artifact, Data: cues}
 	return artifact, cues, nil
 }
@@ -361,25 +352,16 @@ func (r *Runner) EnsureSubtitle(ctx context.Context, mediaPath string, format st
 	}
 
 	cachePath := r.Store.Path("outputs", key, format)
-	if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-		unlock := r.Store.LockPath(cachePath)
-		if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-			r.report(StageRender, "writing %s subtitle", format)
-			rendered, err := subtitle.Render(cues, format)
-			if err != nil {
-				unlock()
-				return Artifact{}, "", false, err
-			}
-			if err := r.Store.WriteFile(cachePath, []byte(rendered), 0o644); err != nil {
-				unlock()
-				return Artifact{}, "", false, err
-			}
-		} else {
-			r.report(StageRender, "cache hit %s", cachePath)
+	_, _, err = ensureArtifact(r.Store, r.Store.CanRead("render"), cachePath, r.renderCacheHit(cachePath), func() (struct{}, error) {
+		r.report(StageRender, "writing %s subtitle", format)
+		rendered, err := subtitle.Render(cues, format)
+		if err != nil {
+			return struct{}{}, err
 		}
-		unlock()
-	} else {
-		r.report(StageRender, "cache hit %s", cachePath)
+		return struct{}{}, r.Store.WriteFile(cachePath, []byte(rendered), 0o644)
+	})
+	if err != nil {
+		return Artifact{}, "", false, err
 	}
 
 	if outputPath == "" {
@@ -397,6 +379,9 @@ func (r *Runner) EnsureScript(ctx context.Context, mediaPath string, format stri
 	if format == "" {
 		format = "txt"
 	}
+	if format != "txt" && format != "md" {
+		return Artifact{}, "", false, fmt.Errorf("unsupported script format %q", format)
+	}
 	transcriptArtifact, t, err := r.EnsureTranscript(ctx, mediaPath)
 	if err != nil {
 		return Artifact{}, "", false, err
@@ -413,25 +398,13 @@ func (r *Runner) EnsureScript(ctx context.Context, mediaPath string, format stri
 	}
 
 	cachePath := r.Store.Path("outputs", key, format)
-	if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-		unlock := r.Store.LockPath(cachePath)
-		if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-			if format != "txt" && format != "md" {
-				unlock()
-				return Artifact{}, "", false, fmt.Errorf("unsupported script format %q", format)
-			}
-			r.report(StageRender, "writing %s script", format)
-			content := strings.TrimSpace(t.Text) + "\n"
-			if err := r.Store.WriteFile(cachePath, []byte(content), 0o644); err != nil {
-				unlock()
-				return Artifact{}, "", false, err
-			}
-		} else {
-			r.report(StageRender, "cache hit %s", cachePath)
-		}
-		unlock()
-	} else {
-		r.report(StageRender, "cache hit %s", cachePath)
+	_, _, err = ensureArtifact(r.Store, r.Store.CanRead("render"), cachePath, r.renderCacheHit(cachePath), func() (struct{}, error) {
+		r.report(StageRender, "writing %s script", format)
+		content := strings.TrimSpace(t.Text) + "\n"
+		return struct{}{}, r.Store.WriteFile(cachePath, []byte(content), 0o644)
+	})
+	if err != nil {
+		return Artifact{}, "", false, err
 	}
 
 	if outputPath == "" {
@@ -462,20 +435,12 @@ func (r *Runner) EnsureWords(ctx context.Context, mediaPath string, outputPath s
 	}
 
 	cachePath := r.Store.Path("outputs", key, "json")
-	if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-		unlock := r.Store.LockPath(cachePath)
-		if !(r.Store.CanRead("render") && r.Store.Exists(cachePath)) {
-			r.report(StageRender, "writing words json")
-			if err := r.Store.WriteJSON(cachePath, t.Words); err != nil {
-				unlock()
-				return Artifact{}, "", false, err
-			}
-		} else {
-			r.report(StageRender, "cache hit %s", cachePath)
-		}
-		unlock()
-	} else {
-		r.report(StageRender, "cache hit %s", cachePath)
+	_, _, err = ensureArtifact(r.Store, r.Store.CanRead("render"), cachePath, r.renderCacheHit(cachePath), func() (struct{}, error) {
+		r.report(StageRender, "writing words json")
+		return struct{}{}, r.Store.WriteJSON(cachePath, t.Words)
+	})
+	if err != nil {
+		return Artifact{}, "", false, err
 	}
 
 	if outputPath == "" {
@@ -491,6 +456,15 @@ func (r *Runner) EnsureWords(ctx context.Context, mediaPath string, outputPath s
 
 func (r *Runner) CacheRoot() string {
 	return r.Store.Root
+}
+
+// renderCacheHit is the shared read step for rendered outputs: the cached file
+// itself is the artifact, so a hit only needs to be reported.
+func (r *Runner) renderCacheHit(path string) func() (struct{}, error) {
+	return func() (struct{}, error) {
+		r.report(StageRender, "cache hit %s", path)
+		return struct{}{}, nil
+	}
 }
 
 func (r *Runner) audioArtifactPath(key string, ext string) (string, bool, error) {
@@ -525,10 +499,6 @@ func artifactFileName(key string, ext string) string {
 		ext = "." + ext
 	}
 	return key + ext
-}
-
-func (r *Runner) log(format string, args ...any) {
-	r.report("", format, args...)
 }
 
 func (r *Runner) report(stage Stage, format string, args ...any) {
