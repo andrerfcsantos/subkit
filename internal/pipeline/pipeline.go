@@ -42,10 +42,20 @@ func DefaultOptions() Options {
 	}
 }
 
+// Transcriber turns a normalized audio artifact into a transcript, returning
+// the normalized form together with the provider's raw response body. It is
+// the seam between the pipeline and a speech-to-text provider: deepgram.Client
+// is the default implementation, and tests or future providers can inject
+// their own.
+type Transcriber interface {
+	TranscribeFile(ctx context.Context, audioPath string, contentType string, opts deepgram.Options) (*transcript.Transcript, []byte, error)
+}
+
 type Runner struct {
 	Store          *cache.Store
 	Opts           Options
 	Reporter       Reporter
+	Transcriber    Transcriber
 	audioMemo      *memoAudio
 	transcriptMemo *memoTranscript
 	cuesMemo       *memoCues
@@ -94,7 +104,16 @@ func NewRunnerWithReporter(opts Options, reporter Reporter) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{Store: store, Opts: opts, Reporter: reporter}, nil
+	return &Runner{Store: store, Opts: opts, Reporter: reporter, Transcriber: deepgram.Client{}}, nil
+}
+
+// transcriber returns the runner's transcriber, defaulting to the Deepgram
+// client for runners constructed without one.
+func (r *Runner) transcriber() Transcriber {
+	if r.Transcriber != nil {
+		return r.Transcriber
+	}
+	return deepgram.Client{}
 }
 
 func (r *Runner) Close() error {
@@ -277,9 +296,8 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 			return nil, err
 		}
 		r.report(StageTranscribe, "calling Deepgram")
-		client := deepgram.Client{}
 		contentType := media.AudioContentType(r.Opts.Audio.Format)
-		t, raw, err := client.TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
+		t, raw, err := r.transcriber().TranscribeFile(ctx, audioArtifact.Path, contentType, r.Opts.Deepgram)
 		if err != nil {
 			return nil, err
 		}
