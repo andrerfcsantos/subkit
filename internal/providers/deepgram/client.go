@@ -229,7 +229,12 @@ func normalizeWords(words []Word, fallbackChannel *int) []transcript.Word {
 
 func normalizeParagraphs(paragraphs Paragraphs) []transcript.Segment {
 	var segments []transcript.Segment
+	// Deepgram only reports a word count per paragraph, so the absolute word
+	// range has to be reconstructed from a running offset across paragraphs.
+	wordOffset := 0
 	for _, paragraph := range paragraphs.Paragraphs {
+		wordStart := wordOffset
+		wordOffset += paragraph.NumWords
 		if len(paragraph.Sentences) == 0 {
 			continue
 		}
@@ -239,8 +244,8 @@ func normalizeParagraphs(paragraphs Paragraphs) []transcript.Segment {
 			Start:     paragraph.Start,
 			End:       paragraph.End,
 			Speaker:   paragraph.Speaker,
-			WordStart: 0,
-			WordEnd:   paragraph.NumWords,
+			WordStart: wordStart,
+			WordEnd:   wordOffset,
 		})
 		for _, sentence := range paragraph.Sentences {
 			segments = append(segments, transcript.Segment{
