@@ -23,6 +23,42 @@ func TestRenderSRT(t *testing.T) {
 	}
 }
 
+func TestRenderSRTLabelsSpeakerOnlyOnChange(t *testing.T) {
+	speakerA, speakerB := 1, 2
+	cues := CueSet{
+		Cues: []Cue{
+			{Start: 0, End: 1, Text: "First.", Speaker: &speakerA},
+			{Start: 1, End: 2, Text: "Second.", Speaker: &speakerA},
+			{Start: 2, End: 3, Text: "Third.", Speaker: &speakerB},
+		},
+	}
+
+	got := RenderSRT(cues)
+	if strings.Count(got, "[speaker 1]") != 1 {
+		t.Fatalf("speaker 1 should be labeled once: %q", got)
+	}
+	if strings.Count(got, "[speaker 2]") != 1 {
+		t.Fatalf("speaker 2 should be labeled once: %q", got)
+	}
+}
+
+func TestRenderSkipsSpeakerLabelsForNetflix(t *testing.T) {
+	speaker := 1
+	cues := CueSet{
+		Options: CueOptions{Algorithm: AlgorithmNetflix},
+		Cues: []Cue{
+			{Start: 0, End: 1, Text: "Hello there.", Speaker: &speaker},
+		},
+	}
+
+	if got := RenderSRT(cues); strings.Contains(got, "speaker") {
+		t.Fatalf("netflix SRT output should not label speakers: %q", got)
+	}
+	if got := RenderWebVTT(cues); strings.Contains(got, "<v") {
+		t.Fatalf("netflix VTT output should not use voice tags: %q", got)
+	}
+}
+
 func TestRenderWebVTT(t *testing.T) {
 	speaker := 1
 	cues := CueSet{

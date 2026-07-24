@@ -1,6 +1,7 @@
 package subtitle
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/andrerfcsantos/subkit-codex/internal/transcript"
@@ -8,25 +9,54 @@ import (
 
 const CueSchemaVersion = "subkit.cues.v1"
 
+const (
+	// AlgorithmDeepgram mirrors the deepgram-go-captions reference: cues are
+	// fixed-size word chunks taken from utterances (or the flat word list),
+	// with no character, duration, or gap shaping.
+	AlgorithmDeepgram = "deepgram"
+	// AlgorithmNetflix follows the Netflix Timed Text Style Guide: 42-char
+	// lines, sentence-aware segmentation, reading-speed timing, and gap
+	// chaining.
+	AlgorithmNetflix = "netflix"
+)
+
+// Algorithms lists the valid cue algorithm names.
+func Algorithms() []string {
+	return []string{AlgorithmDeepgram, AlgorithmNetflix}
+}
+
+// NormalizeAlgorithm lowercases and validates an algorithm name. An empty name
+// selects the default deepgram algorithm.
+func NormalizeAlgorithm(name string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	switch normalized {
+	case "":
+		return AlgorithmDeepgram, nil
+	case AlgorithmDeepgram, AlgorithmNetflix:
+		return normalized, nil
+	}
+	return "", fmt.Errorf("unknown subtitle algorithm %q (valid: %s)", name, strings.Join(Algorithms(), ", "))
+}
+
+// CueOptions tunes cue generation. Numeric fields left at zero use the
+// selected algorithm's own defaults, so each algorithm can honor its
+// specification without one shared set of numbers.
 type CueOptions struct {
 	Algorithm       string  `json:"algorithm"`
-	MaxCharsPerLine int     `json:"max_chars_per_line"`
-	MaxLines        int     `json:"max_lines"`
-	MinDuration     float64 `json:"min_duration"`
-	MaxDuration     float64 `json:"max_duration"`
-	MaxGap          float64 `json:"max_gap"`
+	MaxCharsPerLine int     `json:"max_chars_per_line,omitempty"`
+	MaxLines        int     `json:"max_lines,omitempty"`
+	MaxWordsPerLine int     `json:"max_words_per_line,omitempty"`
+	MinDuration     float64 `json:"min_duration,omitempty"`
+	MaxDuration     float64 `json:"max_duration,omitempty"`
+	MaxGap          float64 `json:"max_gap,omitempty"`
+	ReadingSpeed    float64 `json:"reading_speed,omitempty"`
 	PreferSegments  bool    `json:"prefer_segments"`
 }
 
 func DefaultCueOptions() CueOptions {
 	return CueOptions{
-		Algorithm:       "readable",
-		MaxCharsPerLine: 42,
-		MaxLines:        2,
-		MinDuration:     0.8,
-		MaxDuration:     6.0,
-		MaxGap:          0.9,
-		PreferSegments:  true,
+		Algorithm:      AlgorithmDeepgram,
+		PreferSegments: true,
 	}
 }
 
@@ -46,32 +76,19 @@ type Cue struct {
 	Words   []int   `json:"words,omitempty"`
 }
 
-func BuildCues(t transcript.Transcript, opts CueOptions) CueSet {
-	if opts.Algorithm == "" {
-		opts.Algorithm = "readable"
+func BuildCues(t transcript.Transcript, opts CueOptions) (CueSet, error) {
+	algorithm, err := NormalizeAlgorithm(opts.Algorithm)
+	if err != nil {
+		return CueSet{}, err
 	}
-	if opts.MaxCharsPerLine <= 0 {
-		opts.MaxCharsPerLine = 42
-	}
-	if opts.MaxLines <= 0 {
-		opts.MaxLines = 2
-	}
-	if opts.MinDuration <= 0 {
-		opts.MinDuration = 0.8
-	}
-	if opts.MaxDuration <= 0 {
-		opts.MaxDuration = 6.0
-	}
-	if opts.MaxGap <= 0 {
-		opts.MaxGap = 0.9
-	}
+	opts.Algorithm = algorithm
 
 	var cues []Cue
-	if opts.PreferSegments {
-		cues = cuesFromSegments(t, opts)
-	}
-	if len(cues) == 0 {
-		cues = cuesFromWords(t.Words, opts)
+	switch algorithm {
+	case AlgorithmNetflix:
+		cues = netflixCues(t, opts)
+	default:
+		cues = deepgramCues(t, opts)
 	}
 	for i := range cues {
 		cues[i].Index = i + 1
@@ -82,90 +99,44 @@ func BuildCues(t transcript.Transcript, opts CueOptions) CueSet {
 		SourceSchema:  t.SchemaVersion,
 		Options:       opts,
 		Cues:          cues,
-	}
+	}, nil
 }
 
-func cuesFromSegments(t transcript.Transcript, opts CueOptions) []Cue {
-	var cues []Cue
-	for _, segment := range t.Segments {
-		if segment.Type != "utterance" {
-			continue
-		}
-		if segment.WordEnd > segment.WordStart && segment.WordEnd <= len(t.Words) {
-			cues = append(cues, cuesFromWords(t.Words[segment.WordStart:segment.WordEnd], opts)...)
-			continue
-		}
-		if strings.TrimSpace(segment.Text) != "" && segment.End > segment.Start {
-			cues = append(cues, Cue{
-				Start:   segment.Start,
-				End:     segment.End,
-				Text:    wrapText(segment.Text, opts.MaxCharsPerLine, opts.MaxLines),
-				Speaker: segment.Speaker,
-			})
-		}
-	}
-	return cues
+// wordRun is a contiguous stretch of transcript content an algorithm cues
+// independently. Runs with Words came from an utterance segment (or the flat
+// word list); runs with only a Segment carry text without word timings.
+type wordRun struct {
+	Words   []transcript.Word
+	Segment *transcript.Segment
+	// FromSegment marks runs cut from an utterance segment, as opposed to the
+	// flat word-list fallback.
+	FromSegment bool
 }
 
-func cuesFromWords(words []transcript.Word, opts CueOptions) []Cue {
-	var cues []Cue
-	var current []transcript.Word
-	// currentLen tracks the joined display length of current so measuring the
-	// next candidate doesn't re-join the whole cue for every word.
-	currentLen := 0
-	limit := opts.MaxCharsPerLine * opts.MaxLines
-
-	flush := func() {
-		if len(current) == 0 {
-			return
+// collectRuns gathers the word runs to cue. When preferSegments is set and
+// the transcript has utterance segments, each utterance is its own run;
+// otherwise the whole word list forms a single run.
+func collectRuns(t transcript.Transcript, preferSegments bool) []wordRun {
+	var runs []wordRun
+	if preferSegments {
+		for i := range t.Segments {
+			segment := &t.Segments[i]
+			if segment.Type != "utterance" {
+				continue
+			}
+			if segment.WordEnd > segment.WordStart && segment.WordEnd <= len(t.Words) {
+				runs = append(runs, wordRun{Words: t.Words[segment.WordStart:segment.WordEnd], FromSegment: true})
+				continue
+			}
+			if strings.TrimSpace(segment.Text) != "" && segment.End > segment.Start {
+				runs = append(runs, wordRun{Segment: segment, FromSegment: true})
+			}
 		}
-		first := current[0]
-		last := current[len(current)-1]
-		end := last.End
-		if end-first.Start < opts.MinDuration {
-			end = first.Start + opts.MinDuration
-		}
-		cues = append(cues, Cue{
-			Start:   first.Start,
-			End:     end,
-			Text:    wrapText(wordsText(current), opts.MaxCharsPerLine, opts.MaxLines),
-			Speaker: first.Speaker,
-			Words:   wordIndexes(current),
-		})
-		current = nil
-		currentLen = 0
 	}
-
-	for _, word := range words {
-		if word.Text == "" && word.Punctuated == "" {
-			continue
-		}
-		if len(current) == 0 {
-			current = append(current, word)
-			currentLen = len(word.DisplayText())
-			continue
-		}
-
-		last := current[len(current)-1]
-		nextTextLen := currentLen + 1 + len(word.DisplayText())
-		speakerChanged := speakerValue(last.Speaker) != speakerValue(word.Speaker)
-		gapTooLarge := word.Start-last.End > opts.MaxGap
-		durationTooLong := word.End-current[0].Start > opts.MaxDuration
-		lineTooLong := nextTextLen > limit
-		sentenceBreak := endsSentence(last.DisplayText()) && nextTextLen > opts.MaxCharsPerLine
-
-		if speakerChanged || gapTooLarge || durationTooLong || lineTooLong || sentenceBreak {
-			flush()
-			current = append(current, word)
-			currentLen = len(word.DisplayText())
-			continue
-		}
-		current = append(current, word)
-		currentLen = nextTextLen
+	if len(runs) == 0 && len(t.Words) > 0 {
+		runs = []wordRun{{Words: t.Words}}
 	}
-	flush()
-
-	return cues
+	return runs
 }
 
 func wordsText(words []transcript.Word) string {
@@ -184,45 +155,8 @@ func wordIndexes(words []transcript.Word) []int {
 	return indexes
 }
 
-func wrapText(text string, maxChars int, maxLines int) string {
-	text = strings.Join(strings.Fields(text), " ")
-	if maxChars <= 0 || maxLines <= 0 || len(text) <= maxChars {
-		return text
-	}
-
-	words := strings.Fields(text)
-	var lines []string
-	var line []string
-	for _, word := range words {
-		next := word
-		if len(line) > 0 {
-			next = strings.Join(append(append([]string{}, line...), word), " ")
-		}
-		if len(next) > maxChars && len(line) > 0 {
-			lines = append(lines, strings.Join(line, " "))
-			line = []string{word}
-			continue
-		}
-		line = append(line, word)
-	}
-	if len(line) > 0 {
-		lines = append(lines, strings.Join(line, " "))
-	}
-	if len(lines) <= maxLines {
-		return strings.Join(lines, "\n")
-	}
-
-	merged := strings.Join(lines, " ")
-	return merged
-}
-
-func endsSentence(text string) bool {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return false
-	}
-	last := text[len(text)-1]
-	return last == '.' || last == '?' || last == '!'
+func collapseSpaces(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func speakerValue(speaker *int) int {

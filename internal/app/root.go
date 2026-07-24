@@ -16,8 +16,9 @@ import (
 )
 
 type outputSpec struct {
-	Kind   string
-	Format string
+	Kind      string
+	Format    string
+	Algorithm string
 }
 
 func NewRootCommand() *cobra.Command {
@@ -287,28 +288,52 @@ func addDeepgramFlags(cmd *cobra.Command, opts *deepgram.Options) {
 }
 
 func addCueFlags(cmd *cobra.Command, opts *subtitle.CueOptions) {
-	cmd.Flags().StringVar(&opts.Algorithm, "subtitle-algorithm", opts.Algorithm, "subtitle cue algorithm")
-	cmd.Flags().IntVar(&opts.MaxCharsPerLine, "subtitle-max-chars", opts.MaxCharsPerLine, "max characters per subtitle line")
-	cmd.Flags().IntVar(&opts.MaxLines, "subtitle-max-lines", opts.MaxLines, "max lines per subtitle cue")
-	cmd.Flags().Float64Var(&opts.MinDuration, "subtitle-min-duration", opts.MinDuration, "minimum cue duration in seconds")
-	cmd.Flags().Float64Var(&opts.MaxDuration, "subtitle-max-duration", opts.MaxDuration, "maximum cue duration in seconds")
-	cmd.Flags().Float64Var(&opts.MaxGap, "subtitle-max-gap", opts.MaxGap, "pause length that forces a cue boundary")
+	cmd.Flags().StringVar(&opts.Algorithm, "subtitle-algorithm", opts.Algorithm, "subtitle cue algorithm: "+strings.Join(subtitle.Algorithms(), " or "))
+	cmd.Flags().IntVar(&opts.MaxCharsPerLine, "subtitle-max-chars", opts.MaxCharsPerLine, "max characters per subtitle line (0 = algorithm default)")
+	cmd.Flags().IntVar(&opts.MaxLines, "subtitle-max-lines", opts.MaxLines, "max lines per subtitle cue (0 = algorithm default)")
+	cmd.Flags().IntVar(&opts.MaxWordsPerLine, "subtitle-max-words", opts.MaxWordsPerLine, "max words per cue for the deepgram algorithm (0 = algorithm default)")
+	cmd.Flags().Float64Var(&opts.MinDuration, "subtitle-min-duration", opts.MinDuration, "minimum cue duration in seconds (0 = algorithm default)")
+	cmd.Flags().Float64Var(&opts.MaxDuration, "subtitle-max-duration", opts.MaxDuration, "maximum cue duration in seconds (0 = algorithm default)")
+	cmd.Flags().Float64Var(&opts.MaxGap, "subtitle-max-gap", opts.MaxGap, "pause length that forces a cue boundary (0 = algorithm default)")
+	cmd.Flags().Float64Var(&opts.ReadingSpeed, "subtitle-reading-speed", opts.ReadingSpeed, "reading speed in characters per second for the netflix algorithm (0 = algorithm default)")
 	cmd.Flags().BoolVar(&opts.PreferSegments, "subtitle-prefer-segments", opts.PreferSegments, "prefer provider utterance segments when cueing")
 }
 
 func parseOutputSpecs(values []string) ([]outputSpec, error) {
 	var specs []outputSpec
 	for _, value := range flagutil.SplitCSV(values) {
-		kind, format, ok := strings.Cut(value, ":")
-		if !ok {
+		parts := strings.Split(value, ":")
+		if len(parts) < 2 {
 			return nil, fmt.Errorf("output %q should look like kind:format", value)
 		}
-		kind = strings.ToLower(strings.TrimSpace(kind))
-		format = strings.ToLower(strings.TrimSpace(format))
+		kind := strings.ToLower(strings.TrimSpace(parts[0]))
+		format := strings.ToLower(strings.TrimSpace(parts[1]))
 		if kind == "" || format == "" {
 			return nil, fmt.Errorf("output %q should look like kind:format", value)
 		}
-		specs = append(specs, outputSpec{Kind: kind, Format: format})
+		spec := outputSpec{Kind: kind, Format: format}
+		for _, part := range parts[2:] {
+			key, optionValue, ok := strings.Cut(part, "=")
+			key = strings.ToLower(strings.TrimSpace(key))
+			optionValue = strings.TrimSpace(optionValue)
+			if !ok || key == "" || optionValue == "" {
+				return nil, fmt.Errorf("output %q has option %q; options should look like key=value", value, part)
+			}
+			switch key {
+			case "algorithm":
+				if normalizeOutputKind(kind) != "subtitle" {
+					return nil, fmt.Errorf("output %q: the algorithm option only applies to subtitle outputs", value)
+				}
+				algorithm, err := subtitle.NormalizeAlgorithm(optionValue)
+				if err != nil {
+					return nil, fmt.Errorf("output %q: %w", value, err)
+				}
+				spec.Algorithm = algorithm
+			default:
+				return nil, fmt.Errorf("output %q has unknown option %q", value, key)
+			}
+		}
+		specs = append(specs, spec)
 	}
 	return specs, nil
 }

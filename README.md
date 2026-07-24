@@ -53,14 +53,12 @@ Progress defaults to an interactive Bubble Tea view for multi-file terminal runs
 
 For `extract-audio`, `transcribe`, and `cues`, `--out` remains a single-input exact path. Use `--output-dir` or `--output-template` for batch copies.
 
-The default Deepgram model is `nova-2-video`, per the prototype spec. Deepgram rejected `nova-2-video` with `pt-PT` during verification, so the sample Portuguese video currently needs `--model general --language pt-PT`.
-
 ## Defaults
 
 Deepgram defaults:
 
 ```text
-model:        nova-2-video
+model:        nova-3
 punctuate:    true
 paragraphs:   true
 smart_format: true
@@ -80,14 +78,35 @@ channels: 1
 Subtitle cue defaults:
 
 ```text
-algorithm:          readable
-max chars per line: 42
-max lines:          2
-min duration:       0.8s
-max duration:       6.0s
-max gap:            0.9s
-prefer segments:    true
+algorithm:       deepgram
+prefer segments: true
 ```
+
+Numeric cue flags (`--subtitle-max-chars`, `--subtitle-max-lines`, `--subtitle-max-words`, `--subtitle-min-duration`, `--subtitle-max-duration`, `--subtitle-max-gap`, `--subtitle-reading-speed`) default to `0`, which means "use the selected algorithm's own defaults".
+
+## Subtitle algorithms
+
+Select the cue algorithm with `--subtitle-algorithm deepgram|netflix` (available on `subtitle`, `generate`, `cues`, and `render`). For `generate` and `render`, individual subtitle outputs can also override it inside the output spec:
+
+```bash
+subkit generate movie.mp4 --output subtitle:srt:algorithm=netflix
+```
+
+`deepgram` (default) is a port of [deepgram-go-captions](https://github.com/andrerfcsantos/deepgram-go-captions): utterances (or the flat word list) are chunked into fixed-size groups of 8 words (`--subtitle-max-words`), the flat word path also splits on speaker changes when diarization is on, and cue timing is exactly the first word's start to the last word's end. Speaker labels are emitted when the speaker changes between cues.
+
+`netflix` follows the Netflix Timed Text Style Guide (general requirements, subtitle timing guidelines, and subtitle template guides):
+
+```text
+max chars per line: 42 (Latin scripts)
+max lines:          2, favoring bottom-heavy line splits
+min duration:       5/6s per event
+max duration:       7s per event
+reading speed:      17 chars/second (adult templates)
+event gaps:         minimum 2 frames at 24fps; gaps under 0.5s are closed to 2 frames
+out-times:          extended ~0.5s past the audio when the next event allows
+```
+
+Events are segmented sentence-first: cues never span speaker changes or silences longer than `--subtitle-max-gap` (default 1s), whole sentences are packed together while they fit, and oversized sentences are split at the best linguistic break point (after punctuation, before conjunctions and prepositions, never right after an article). Line breaks inside a cue use the same scoring, with English and Portuguese function-word lists; other languages fall back to punctuation and balance. Netflix-styled output carries no speaker labels, per the style guide. Frame-based rules assume 24fps, and shot-change alignment is out of scope since cue generation never inspects video frames.
 
 ## Cache controls
 

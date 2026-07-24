@@ -12,6 +12,7 @@ import (
 	"github.com/andrerfcsantos/subkit-codex/internal/cache"
 	"github.com/andrerfcsantos/subkit-codex/internal/naming"
 	"github.com/andrerfcsantos/subkit-codex/internal/pipeline"
+	"github.com/andrerfcsantos/subkit-codex/internal/subtitle"
 	"github.com/spf13/cobra"
 )
 
@@ -28,9 +29,10 @@ type batchJob struct {
 }
 
 type plannedOutput struct {
-	Kind   string
-	Format string
-	Path   string
+	Kind      string
+	Format    string
+	Path      string
+	Algorithm string
 }
 
 type outputResult struct {
@@ -171,7 +173,7 @@ func planRenderJobs(inputs []string, specs []outputSpec, outputDir string, outpu
 			if err != nil {
 				return nil, err
 			}
-			job.Outputs = append(job.Outputs, plannedOutput{Kind: kind, Format: spec.Format, Path: path})
+			job.Outputs = append(job.Outputs, plannedOutput{Kind: kind, Format: spec.Format, Path: path, Algorithm: spec.Algorithm})
 		}
 		jobs = append(jobs, job)
 	}
@@ -209,6 +211,13 @@ func runBatchWithProcessor(ctx context.Context, out io.Writer, opts pipeline.Opt
 	if out == nil {
 		out = io.Discard
 	}
+	// Fail on a bad --subtitle-algorithm before any extraction or provider
+	// calls happen.
+	algorithm, err := subtitle.NormalizeAlgorithm(opts.Cues.Algorithm)
+	if err != nil {
+		return err
+	}
+	opts.Cues.Algorithm = algorithm
 	if flags.Concurrency == 0 {
 		flags.Concurrency = batch.DefaultConcurrency
 	}
@@ -304,7 +313,7 @@ func processBatchJob(ctx context.Context, job batchJob, opts pipeline.Options, r
 func processPlannedOutput(ctx context.Context, runner *pipeline.Runner, input string, output plannedOutput, reporter pipeline.Reporter) (outputResult, error) {
 	switch output.Kind {
 	case "subtitle":
-		_, path, copied, err := runner.EnsureSubtitle(ctx, input, output.Format, output.Path)
+		_, path, copied, err := runner.EnsureSubtitle(ctx, input, output.Format, output.Path, output.Algorithm)
 		return outputResult{Path: path, Copied: copied}, err
 	case "script":
 		_, path, copied, err := runner.EnsureScript(ctx, input, output.Format, output.Path)

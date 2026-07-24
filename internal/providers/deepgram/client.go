@@ -34,7 +34,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		Provider:      "deepgram",
-		Model:         "nova-2-video",
+		Model:         "nova-3",
 		Punctuate:     true,
 		Paragraphs:    true,
 		SmartFormat:   true,

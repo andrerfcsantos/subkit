@@ -320,6 +320,10 @@ func (r *Runner) EnsureTranscript(ctx context.Context, mediaPath string) (Artifa
 }
 
 func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, subtitle.CueSet, error) {
+	return r.ensureCues(ctx, mediaPath, r.Opts.Cues)
+}
+
+func (r *Runner) ensureCues(ctx context.Context, mediaPath string, cueOpts subtitle.CueOptions) (Artifact, subtitle.CueSet, error) {
 	transcriptArtifact, t, err := r.EnsureTranscript(ctx, mediaPath)
 	if err != nil {
 		return Artifact{}, subtitle.CueSet{}, err
@@ -328,7 +332,7 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 		"pipeline":       PipelineVersion,
 		"step":           "cues",
 		"transcript_key": transcriptArtifact.Key,
-		"options":        r.Opts.Cues,
+		"options":        cueOpts,
 	})
 	if err != nil {
 		return Artifact{}, subtitle.CueSet{}, err
@@ -347,7 +351,10 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 		return cues, nil
 	}, func() (subtitle.CueSet, error) {
 		r.report(StageCues, "building subtitle cues")
-		cues := subtitle.BuildCues(*t, r.Opts.Cues)
+		cues, err := subtitle.BuildCues(*t, cueOpts)
+		if err != nil {
+			return subtitle.CueSet{}, err
+		}
 		return cues, r.Store.WriteJSON(path, cues)
 	})
 	if err != nil {
@@ -359,9 +366,16 @@ func (r *Runner) EnsureCues(ctx context.Context, mediaPath string) (Artifact, su
 	return artifact, cues, nil
 }
 
-func (r *Runner) EnsureSubtitle(ctx context.Context, mediaPath string, format string, outputPath string) (Artifact, string, bool, error) {
+// EnsureSubtitle renders one subtitle output. algorithm optionally overrides
+// the configured cue algorithm for this output only; empty keeps the
+// configured one.
+func (r *Runner) EnsureSubtitle(ctx context.Context, mediaPath string, format string, outputPath string, algorithm string) (Artifact, string, bool, error) {
 	format = strings.ToLower(format)
-	cuesArtifact, cues, err := r.EnsureCues(ctx, mediaPath)
+	cueOpts := r.Opts.Cues
+	if algorithm != "" {
+		cueOpts.Algorithm = algorithm
+	}
+	cuesArtifact, cues, err := r.ensureCues(ctx, mediaPath, cueOpts)
 	if err != nil {
 		return Artifact{}, "", false, err
 	}

@@ -18,11 +18,16 @@ func Render(cues CueSet, format string) (string, error) {
 }
 
 func RenderSRT(cues CueSet) string {
+	speakerLabels := speakerLabelsEnabled(cues)
 	var output []string
+	previousSpeaker := -1
 	for i, cue := range cues.Cues {
 		output = append(output, strconv.Itoa(i+1))
 		output = append(output, fmt.Sprintf("%s --> %s", timestampSRT(cue.Start), timestampSRT(cue.End)))
-		if cue.Speaker != nil {
+		// Match the reference renderer: label the speaker only when it
+		// changes from the previous cue.
+		if speakerLabels && cue.Speaker != nil && *cue.Speaker != previousSpeaker {
+			previousSpeaker = *cue.Speaker
 			output = append(output, fmt.Sprintf("[speaker %d]", *cue.Speaker))
 		}
 		output = append(output, cue.Text)
@@ -32,17 +37,25 @@ func RenderSRT(cues CueSet) string {
 }
 
 func RenderWebVTT(cues CueSet) string {
+	speakerLabels := speakerLabelsEnabled(cues)
 	output := []string{"WEBVTT", ""}
 	for _, cue := range cues.Cues {
 		output = append(output, fmt.Sprintf("%s --> %s", timestampVTT(cue.Start), timestampVTT(cue.End)))
 		text := cue.Text
-		if cue.Speaker != nil {
+		if speakerLabels && cue.Speaker != nil {
 			text = fmt.Sprintf("<v Speaker %d>%s", *cue.Speaker, text)
 		}
 		output = append(output, text)
 		output = append(output, "")
 	}
 	return strings.Join(output, "\n")
+}
+
+// speakerLabelsEnabled reports whether rendered output should carry speaker
+// markers. Netflix-styled cues omit them: the style guide identifies speakers
+// with dialogue punctuation, not labels.
+func speakerLabelsEnabled(cues CueSet) bool {
+	return cues.Options.Algorithm != AlgorithmNetflix
 }
 
 func timestampSRT(seconds float64) string {
